@@ -1,0 +1,25 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Konnect Schematic Viewer",
+  "version": "0.2.0",
+  "identifier": "com.github.mixelpixx.konnect.viewer",
+  "build": {
+    "frontendDist": "frontend"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Schematic Viewer — Konnect",
+        "width": 1280,
+        "height": 900,
+        "resizable": true,
+        "fullscreen": false,
+        "dragDropEnabled": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": false
+  }
+}

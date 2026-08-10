@@ -1,0 +1,21 @@
+/target/
+crates/*/target/
+crates/schematic-viewer/target/
+*.exe
+*.dll
+*.so
+*.dylib
+*.tmp
+*.bak
+dist/
+
+# macOS
+.DS_Store
+*.webloc
+
+# Python bytecode (plugin/ is a thin wxPython launcher)
+__pycache__/
+*.pyc
+
+# Unpacked release packages (built artifacts, not source)
+konnect-pcm-v*/

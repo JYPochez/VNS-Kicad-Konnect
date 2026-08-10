@@ -1,0 +1,31 @@
+//! MCP server session context.
+
+use super::protocol::*;
+use crate::router::ToolRouter;
+use std::sync::Arc;
+
+pub struct McpServerState {
+    pub router: Arc<ToolRouter>,
+}
+
+impl McpServerState {
+    pub fn new(router: Arc<ToolRouter>) -> Self {
+        McpServerState { router }
+    }
+
+    pub fn build_initialize_result() -> InitializeResult {
+        InitializeResult {
+            protocol_version: "2024-11-05".to_string(),
+            capabilities: ServerCapabilities {
+                tools: Some(ToolsCapability {
+                    list_changed: Some(true),
+                }),
+                ..Default::default()
+            },
+            server_info: ServerInfo {
+                name: "konnect".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+        }
+    }
+}

@@ -1,0 +1,59 @@
+{
+  "$schema": "https://go.kicad.org/pcm/schemas/v1",
+  "name": "Konnect",
+  "description": "AI-assisted PCB design via the Model Context Protocol. Enables Claude and other AI assistants to design schematics and PCBs with 185 tools organized into on-demand toolsets.",
+  "description_full": "Konnect exposes a complete set of KiCAD design tools to AI assistants via the Model Context Protocol (MCP). It supports schematic editing, PCB layout, routing, library management, JLCPCB part search, Freerouting autoroute, ERC/DRC, design review audits, and full export pipelines. Tools are organized into 18 toolsets loaded on demand so the AI only sees relevant tools at once.",
+  "identifier": "com.github.mixelpixx.konnect",
+  "type": "plugin",
+  "author": {
+    "name": "mixelpixx",
+    "contact": {
+      "web": "https://github.com/mixelpixx"
+    }
+  },
+  "license": "open-source",
+  "resources": {
+    "homepage": "https://github.com/mixelpixx/Konnect"
+  },
+  "versions": [
+    {
+      "version": "0.2.0",
+      "status": "stable",
+      "kicad_version": "10.0",
+      "kicad_version_max": "10.99",
+      "platforms": [
+        "windows"
+      ],
+      "download_sha256": "8abdd37e6494efd992591fef4ab223d526acd92389b7fe27350c417f3169c4bd",
+      "download_size": 8877840,
+      "download_url": "https://github.com/mixelpixx/Konnect/releases/download/v0.2.0/konnect-pcm-v0.2.0-windows.zip",
+      "install_size": 24923604
+    },
+    {
+      "version": "0.2.0",
+      "status": "stable",
+      "kicad_version": "10.0",
+      "kicad_version_max": "10.99",
+      "platforms": [
+        "macos"
+      ],
+      "download_sha256": "8ad8191f15740a76e35daed8a6018fc6ae3d8d771e0e00aa3b65e67fd8ed2a99",
+      "download_size": 17993681,
+      "download_url": "https://github.com/mixelpixx/Konnect/releases/download/v0.2.0/konnect-pcm-v0.2.0-macos.zip",
+      "install_size": 53770299
+    },
+    {
+      "version": "0.2.0",
+      "status": "stable",
+      "kicad_version": "10.0",
+      "kicad_version_max": "10.99",
+      "platforms": [
+        "linux"
+      ],
+      "download_sha256": "ff34be7035ec5c770c0b43bd04d3e655d001292092a27bd84453dbbf8b159803",
+      "download_size": 6497658,
+      "download_url": "https://github.com/mixelpixx/Konnect/releases/download/v0.2.0/konnect-pcm-v0.2.0-linux.zip",
+      "install_size": 17911291
+    }
+  ]
+}
