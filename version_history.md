@@ -13,7 +13,28 @@ The gate for each is upstream's own CI: `cargo test --workspace --lib --tests`,
 
 ## Unreleased — fixes on top of v0.2.2
 
-Test count: **407 → 437** (30 added). Clippy clean on upstream's CI invocation.
+Test count: **407 → 439** (32 added). Clippy clean on upstream's CI invocation.
+
+### `fix(sch)`: resolve pins against the owning unit of a multi-unit symbol
+
+**Problem — silent net shorts.** A multi-unit symbol (a 74HC14, an op-amp, any part
+eeschema splits into gates) is placed as one instance *per unit*, all sharing the reference.
+`batch_connect_to_net` took the **first** instance matching the reference and transformed
+every requested pin by *that* instance's placement. Ask for a pin owned by unit 2 and the
+label landed on unit 1's pin instead.
+
+Two different nets then occupied one coordinate and were **silently shorted** — no error, no
+warning, and the tool cheerfully reported success with a plausible-looking position. Caught
+in real use: `X_CLK_IN` and `X_DATA_IN` both landed on U6 pin 1 while wiring a 74HC14 scale
+buffer.
+
+**Fix.** Search every instance sharing the reference and resolve against the one whose unit
+actually owns the pin, using `extract_lib_pins_for_unit`. Both the instance lookup and the
+pin transform then come from the same unit.
+
+**Tests.** Two units of one symbol placed 15.24 mm apart, each owning a pin at the same
+*local* coordinate: the resolved positions must differ and must match their own unit's
+placement. That assertion fails against the old code.
 
 ### `feat(sch)`: add `update_symbols_from_library`
 
