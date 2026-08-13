@@ -18,6 +18,48 @@ routing, ERC/DRC, design-review audits, JLCPCB part search, Freerouting, referen
 circuits, and a full manufacturing export pipeline — with bundled skills and agents
 that teach Claude KiCAD conventions out of the box.
 
+> ### This is a fork
+>
+> [JYPochez/VNS-Kicad-Konnect](https://github.com/JYPochez/VNS-Kicad-Konnect) — a fork of
+> [mixelpixx/Konnect](https://github.com/mixelpixx/Konnect) v0.2.2, carrying correctness
+> fixes and a few tools found missing while using it on real hardware. Everything here is
+> offered back upstream; the fork is not a divergence.
+>
+> **Fixes**
+>
+> - **Symbol libraries resolve through `sym-lib-table`.** `resolve_lib_symbol` scanned a
+>   hardcoded list of install directories for a file named after the library nickname, so
+>   every user library was invisible — and on any non-standard KiCad install (a macOS bundle
+>   outside `/Applications`, say) *no symbol resolved at all*. Footprints got table-aware
+>   resolution in v0.2.1; symbols never did. Now the table is read first, following
+>   `(type "Table")` indirection and expanding `${KIPRJMOD}`, environment variables and the
+>   user path variables set in Preferences → Configure Paths.
+> - **Net queries are deterministic.** `net_at` returned the first label reached while
+>   iterating a `HashMap`, so a net carrying two labels resolved differently between runs.
+>   Results are now sorted and stable, and `nets_at` exposes the whole set so a conflicting
+>   label becomes a reportable error instead of a coin-flip.
+> - **Mid-wire query points connect.** A pin landing on a wire's interior, or any
+>   `trace_from_point` coordinate, resolved to an isolated component and read as
+>   unconnected.
+> - **Union-find no longer overflows the stack.** Path compression recursed; a long parent
+>   chain aborted the process, which no handler can catch. Now iterative, with union-by-size.
+> - **A panicking tool no longer kills the server.** Handlers were awaited inline, so one
+>   panic unwound out of `main` and took every other loaded tool with it.
+> - **String escapes decode correctly.** Chained `replace` calls collapsed backslashes last,
+>   so a serialized `C:\\new` came back as `C:\` followed by a real newline.
+>
+> **Added tools**
+>
+> - `update_symbols_from_library` — eeschema's *Update Symbols from Library*. Refuses any
+>   symbol whose pins moved, since wires and labels sit at the old coordinates.
+> - `rename_project` — renames the project files *and* the internal references. Renaming
+>   files alone orphans every reference designator, because each symbol instance stores
+>   `(project "name")`.
+> - `reload_server` — `exec`s into the rebuilt binary in place, keeping the PID and stdio
+>   pipes so the MCP client's connection survives. Verifies the new binary first.
+>
+> 437 tests (30 added); `cargo clippy --workspace -- -D warnings` clean.
+
 > **Status: beta.** The core toolchain is tested and working, but this is a young
 > release and it wants real-world mileage and review. Issues and PRs are welcome —
 > see [CONTRIBUTING.md](CONTRIBUTING.md) and the

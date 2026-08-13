@@ -73,6 +73,26 @@ Exposing all 185 tools costs ~25K tokens per listing, so the router only pre-loa
 - Load/unload emits `tools/list_changed`.
 - Calling an unloaded tool returns a structured error naming the owning toolset so the model can load and retry in one hop — don't degrade that message to a generic "unknown tool".
 
+## Publishing to the fork
+
+`./publish-to-fork.sh` (dry run) / `--push`. Never push without an explicit go-ahead.
+
+The published tree must be **upstream's file set plus the code changes only**, so a PR reads
+as a clean diff. These stay local and are stripped by the script:
+
+| Withheld | Why |
+|---|---|
+| `CLAUDE.md` | agent instructions |
+| `version_history.md` | local changelog; the README carries the public summary |
+| `README-FORK.md` | superseded — the fork summary lives in `README.md` |
+| `docs/CODE_REVIEW.md` | working notes |
+| `docs/kicad-bug-report-*.md` | KiCad bug reports, not Konnect's concern |
+| `publish-to-fork.sh` | this script |
+
+`target/` and the local Rust toolchain are already gitignored. The script also lists any
+other file not present in upstream `v0.2.2`, so nothing sneaks into a PR unnoticed, and runs
+the CI gate (`fmt --check`, `clippy -D warnings`, tests) before pushing.
+
 ## Conventions
 
 **Every commit updates `version_history.md`** — add an entry for the change under "Unreleased" with the problem, the fix and the tests, in the same commit as the code. The file is the fork's changelog and the source for `README-FORK.md`; a commit that changes behaviour without an entry there is incomplete.
