@@ -13,7 +13,34 @@ The gate for each is upstream's own CI: `cargo test --workspace --lib --tests`,
 
 ## Unreleased — fixes on top of v0.2.2
 
-Test count: **407 → 444** (37 added). Clippy clean on upstream's CI invocation.
+Test count: **407 → 447** (40 added). Clippy clean on upstream's CI invocation.
+
+### `fix(sch)`: `add_schematic_text` wrote schematics KiCad could not open
+
+**Problem — one call made the whole file unloadable.** Two independent defects in
+`handle_add_schematic_text`, either of which is fatal at the *file* level:
+
+- **Wrong position.** The node was spliced in at `content.rfind(')')`, i.e. immediately before
+  the file's final paren — which puts it *after* the symbol instances and `sheet_instances`.
+  KiCad 10 requires symbol instances last. `sch_wiring.rs` already had
+  `insert_before_close()` for exactly this, with the ordering rule spelled out above it; this
+  handler simply never used it.
+- **Unescaped newlines.** Only `\` and `"` were escaped, so a multi-line annotation was
+  written with literal newline bytes inside the quoted string. KiCad's reader wants the
+  two-character `\n` escape.
+
+Either one produces `Failed to load schematic` from `kicad-cli` and a load failure in
+eeschema, with **no indication of which element is at fault** — and the tool reports success,
+so the damage is only discovered later. Hit for real: a three-line note added to a working
+schematic made it unopenable, and because ERC then fails to run, a *stale* ERC report from
+the previous run is what gets read.
+
+**Fix.** Route the insert through `sch_wiring::insert_before_close` (now `pub(crate)`), and
+escape `\r` (dropped), `\n` and `\t` alongside the existing quote and backslash handling.
+
+**Tests.** Three: the text lands before the first symbol instance and after `lib_symbols`; a
+multi-line string is written with `\n` escapes rather than raw bytes; and quotes, backslashes
+and tabs all come out escaped. The first two fail against the old code.
 
 ### `fix(sch)`: apply component-level edits to every unit of a multi-unit symbol
 
