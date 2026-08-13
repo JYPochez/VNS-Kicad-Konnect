@@ -13,7 +13,35 @@ The gate for each is upstream's own CI: `cargo test --workspace --lib --tests`,
 
 ## Unreleased — fixes on top of v0.2.2
 
-Test count: **407 → 433** (26 added). Clippy clean on upstream's CI invocation.
+Test count: **407 → 437** (30 added). Clippy clean on upstream's CI invocation.
+
+### `feat(sch)`: add `update_symbols_from_library`
+
+**Problem.** Editing a symbol in its library has no effect on schematics that already use it.
+`add_schematic_component` and `replace_component` both go through
+`ensure_lib_symbol_in_schematic`, which short-circuits when a definition with that `lib_id` is
+already embedded — so the schematic keeps its stale copy. Hit for real: widening the TM16xx
+body in the library left every placed instance rendering at the old width, and
+`replace_component` with the same `lib_id` did not refresh it.
+
+eeschema has **Tools → Update Symbols from Library** for exactly this; Konnect had no
+equivalent, so the only route was a manual step in the GUI.
+
+**Fix.** `update_symbols_from_library` re-resolves each embedded `lib_symbols` entry from disk
+and replaces it. Optional `lib_id` filter, `dry_run` to preview.
+
+**The safety property that makes it usable.** Wires and labels attach at *pin coordinates*, so
+a library edit that moved a pin would silently orphan them. The tool compares pin anchors
+before and after and **refuses any symbol whose pins moved**, reporting why, unless
+`allow_pin_moves` is passed. Body size and pin *length* changes leave anchors untouched — that
+is the safe case, and the one that motivated the tool.
+
+**Tests.** Four: top-level `lib_symbols` blocks are found with balanced ranges, a schematic
+with no `lib_symbols` yields none, pin anchors detect geometry drift while ignoring
+body/length changes, and anchor comparison is order-independent.
+
+`sch_components` goes 17 → 18 tools; registry `tool_count` updated (its invariant test
+enforces this).
 
 ### `feat(mcp)`: add a `reload_server` meta-tool
 
