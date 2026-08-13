@@ -62,8 +62,16 @@ if ! git remote get-url "$REMOTE" >/dev/null 2>&1; then
 	exit 1
 fi
 
-restore() { git checkout -q "$SOURCE_BRANCH" 2>/dev/null || true; }
-trap restore EXIT
+# The publish branch is built in a throwaway worktree, never by switching this
+# one. `git rm --cached` leaves the removed files on disk as untracked, which
+# then blocks checking the source branch back out — building elsewhere avoids
+# touching your working tree at all.
+WORKTREE="$(mktemp -d)/publish"
+cleanup() {
+	git worktree remove --force "$WORKTREE" 2>/dev/null || true
+	rmdir "$(dirname "$WORKTREE")" 2>/dev/null || true
+}
+trap cleanup EXIT
 
 echo "source branch : $SOURCE_BRANCH"
 echo "remote        : $REMOTE ($(git remote get-url "$REMOTE"))"
@@ -82,20 +90,20 @@ if [ "$PUSH" = "1" ]; then
 	echo
 fi
 
-# ─── Build the publish branch ────────────────────────────────────────────────
+# ─── Build the publish branch in isolation ───────────────────────────────────
 git branch -f "$PUBLISH_BRANCH" "$SOURCE_BRANCH"
-git checkout -q "$PUBLISH_BRANCH"
+git worktree add -q --checkout "$WORKTREE" "$PUBLISH_BRANCH"
 
 REMOVED=()
 for f in "${LOCAL_ONLY[@]}"; do
-	if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
-		git rm -q --cached "$f"
+	if git -C "$WORKTREE" ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+		git -C "$WORKTREE" rm -q -f "$f"
 		REMOVED+=("$f")
 	fi
 done
 
 if [ ${#REMOVED[@]} -gt 0 ]; then
-	git commit -q -m "chore: exclude local-only working files from the published fork
+	git -C "$WORKTREE" commit -q -m "chore: exclude local-only working files from the published fork
 
 CLAUDE.md, the code review, the KiCad bug reports, the local changelog and
 this script are working material for the machine this fork is developed on.
@@ -116,7 +124,7 @@ else
 fi
 
 if [ -n "$UP_LIST" ]; then
-	EXTRA=$(comm -23 <(git ls-files | sort) <(echo "$UP_LIST" | sort) || true)
+	EXTRA=$(comm -23 <(git -C "$WORKTREE" ls-files | sort) <(echo "$UP_LIST" | sort) || true)
 	if [ -n "$EXTRA" ]; then
 		echo "  files added on top of upstream (verify each belongs in a PR):"
 		echo "$EXTRA" | sed 's/^/    /'
