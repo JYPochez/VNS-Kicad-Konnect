@@ -13,7 +13,42 @@ The gate for each is upstream's own CI: `cargo test --workspace --lib --tests`,
 
 ## Unreleased — fixes on top of v0.2.2
 
-Test count: **407 → 430** (23 added). Clippy clean on upstream's CI invocation.
+Test count: **407 → 433** (26 added). Clippy clean on upstream's CI invocation.
+
+### `feat(mcp)`: add a `reload_server` meta-tool
+
+**Problem.** Changing Konnect's source and rebuilding does nothing until the MCP *client* is
+restarted, because the client spawns the server and holds it for the session. During
+development that means a full client restart per iteration — and replacing the binary
+underneath a running server just kills the connection.
+
+**Why the obvious approach doesn't work.** A stdio server cannot restart itself by exiting:
+the client owns the process lifecycle and does not respawn it mid-session.
+
+**Fix.** `exec` into the binary on disk. That replaces the process *image* while keeping the
+PID and the inherited stdin/stdout pipes, so the client's connection is never broken — it
+simply goes on talking to the new build.
+
+Safety, because `exec` is a one-way door:
+
+- The new binary is **run once (`--version`) and checked** before the switch. A half-written
+  copy, a failed link, or an unsigned binary macOS would kill turns into a refused call with
+  the reason, instead of a server that is simply gone.
+- `confirm: true` is required, so a stray call cannot restart the server mid-task.
+- The reply is written before the switch; a short delay covers the transport's flush, since
+  `exec` never returns on success.
+- Windows returns a clear "not supported" error — there is no exec equivalent that preserves
+  the pipes.
+
+Router state does not survive: the new image starts at the starter kit. That is self-healing
+rather than silent — calling a previously loaded tool returns the usual `toolset_not_loaded`
+error naming its toolset, so recovery is one hop.
+
+**Tests.** Three: the meta-tool count is pinned (it is quoted in `DEV.md`, `README.md` and
+`tool-directory.md`, so adding one now forces those to be updated in the same commit), every
+advertised meta-tool actually dispatches, and `reload_server` refuses without `confirm`.
+
+Meta-tools go from 6 to 7; docs updated to 194 total.
 
 ### `fix(sch-editor)`: resolve symbol libraries through sym-lib-table
 
