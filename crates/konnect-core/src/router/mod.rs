@@ -95,6 +95,17 @@ impl ToolRouter {
         self.loaded_tools.read().await.get(name).cloned()
     }
 
+    /// Load a tool that is not in the static registry. Test-only, so that
+    /// dispatch behaviour (e.g. the panic boundary in `McpHandler`) can be
+    /// exercised without a real toolset. Not compiled into the library.
+    #[cfg(test)]
+    pub(crate) async fn insert_tool_for_test(&self, def: ToolDef) {
+        self.loaded_tools
+            .write()
+            .await
+            .insert(def.name.to_string(), def);
+    }
+
     /// Return all currently active ToolDefs for use in MCP tool listings.
     pub async fn active_tools(&self) -> Vec<ToolDef> {
         self.loaded_tools.read().await.values().cloned().collect()
