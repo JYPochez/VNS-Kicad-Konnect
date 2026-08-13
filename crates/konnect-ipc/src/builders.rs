@@ -83,20 +83,65 @@ pub fn build_track(
     }
 }
 
-/// Build S-expression for a via (used with ParseAndCreateItemsFromString).
-/// Complex protobuf PadStack construction is avoided this way.
-pub fn via_sexp(
+/// Build a through-via `Via` protobuf message (F.Cu → B.Cu).
+///
+/// Mirrors [`build_track`]: the caller `pack_any`s the result and hands it to
+/// `create_items`. The earlier implementation built a bare `(via …)`
+/// S-expression string and fed it to `ParseAndCreateItemsFromString`; that
+/// paste path silently created nothing (the command returns a
+/// `CreateItemsResponse` whose overall status is `IRS_OK` even when zero items
+/// are created), so `add_via` reported success while no via ever appeared.
+/// Building the protobuf and going through `create_items` is the same path that
+/// `add_track` (and the reference `kipy` client) use, and it actually persists.
+pub fn build_via(
     net_name: &str,
     net_code: i32,
     x: f64,
     y: f64,
     drill_mm: f64,
     size_mm: f64,
-) -> String {
-    format!(
-        r#"(via (at {} {}) (size {}) (drill {}) (layers "F.Cu" "B.Cu") (net {} "{}"))"#,
-        x, y, size_mm, drill_mm, net_code, net_name
-    )
+) -> kiapi::board::types::Via {
+    use kiapi::board::types::{
+        BoardLayer, DrillProperties, DrillShape, PadStack, PadStackLayer, PadStackShape,
+        PadStackType, ViaType,
+    };
+
+    // A PST_NORMAL padstack carries exactly ONE copper-layer entry, keyed to
+    // KiCad's ALL_LAYERS sentinel (== F_Cu). PADSTACK::unpackCopperLayer
+    // rejects any other layer while the mode is NORMAL, which fails the whole
+    // PCB_VIA deserialization ("could not unpack PCB_VIA", AS_BAD_REQUEST) —
+    // sending an F.Cu + B.Cu pair here is what broke add_via in v0.2.1 (#117).
+    // The through span is defined by the drill's start/end layers, not by the
+    // copper entries.
+    let copper_pad = PadStackLayer {
+        layer: BoardLayer::BlFCu as i32,
+        shape: PadStackShape::PssCircle as i32,
+        size: Some(vec2(size_mm, size_mm)),
+        ..PadStackLayer::default()
+    };
+
+    let pad_stack = PadStack {
+        r#type: PadStackType::PstNormal as i32,
+        layers: vec![BoardLayer::BlFCu as i32, BoardLayer::BlBCu as i32],
+        drill: Some(DrillProperties {
+            start_layer: BoardLayer::BlFCu as i32,
+            end_layer: BoardLayer::BlBCu as i32,
+            diameter: Some(vec2(drill_mm, drill_mm)),
+            shape: DrillShape::DsCircle as i32,
+            ..DrillProperties::default()
+        }),
+        copper_layers: vec![copper_pad],
+        ..PadStack::default()
+    };
+
+    kiapi::board::types::Via {
+        id: None, // KiCAD assigns the ID
+        position: Some(vec2(x, y)),
+        pad_stack: Some(pad_stack),
+        locked: kiapi::common::types::LockedState::LsUnlocked as i32,
+        net: Some(net(net_name, net_code)),
+        r#type: ViaType::VtThrough as i32,
+    }
 }
 
 /// Pack a protobuf message into a prost_types::Any.
@@ -210,10 +255,11 @@ pub fn board_circle(
     cx: f64,
     cy: f64,
     r_mm: f64,
+    filled: bool,
 ) -> kiapi::board::types::BoardGraphicShape {
     board_shape(
         layer,
-        attrs(width_mm, false),
+        attrs(width_mm, filled),
         kiapi::common::types::graphic_shape::Geometry::Circle(
             kiapi::common::types::GraphicCircleAttributes {
                 center: Some(vec2(cx, cy)),
@@ -251,9 +297,12 @@ pub fn board_arc(
 
 /// Build a BoardGraphicShape polygon (or set of polygons) from closed point
 /// loops in mm — one `PolygonWithHoles` per outline, no holes. Used by
-/// `import_svg_logo` to place flattened SVG artwork as filled board graphics.
+/// `import_svg_logo` to place flattened SVG artwork as filled board graphics
+/// (stroke width 0) and by footprint placement for `fp_poly` outlines and
+/// non-cardinal-rotation rectangles, which keep their stroke width.
 pub fn board_polygon(
     layer: &str,
+    width_mm: f64,
     filled: bool,
     outlines: &[Vec<(f64, f64)>],
 ) -> kiapi::board::types::BoardGraphicShape {
@@ -277,7 +326,7 @@ pub fn board_polygon(
 
     board_shape(
         layer,
-        attrs(0.0, filled),
+        attrs(width_mm, filled),
         kiapi::common::types::graphic_shape::Geometry::Polygon(kiapi::common::types::PolySet {
             polygons,
         }),
@@ -329,7 +378,7 @@ pub fn board_text(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use kiapi::common::types::graphic_shape::Geometry;
 
@@ -369,7 +418,7 @@ mod tests {
 
     #[test]
     fn circle_radius_point_is_center_plus_radius() {
-        let s = board_circle("F.SilkS", 0.1, 5.0, 5.0, 2.5);
+        let s = board_circle("F.SilkS", 0.1, 5.0, 5.0, 2.5, false);
         match s.shape.unwrap().geometry.unwrap() {
             Geometry::Circle(c) => {
                 assert_eq!(c.center.unwrap().x_nm, 5_000_000);
@@ -412,7 +461,7 @@ mod tests {
             vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
             vec![(5.0, 5.0), (6.0, 5.0), (6.0, 6.0)],
         ];
-        let s = board_polygon("F.SilkS", true, &outlines);
+        let s = board_polygon("F.SilkS", 0.0, true, &outlines);
         assert_eq!(s.layer, kiapi::board::types::BoardLayer::BlFSilkS as i32);
         let shape = s.shape.expect("shape");
         assert_eq!(
@@ -435,7 +484,7 @@ mod tests {
     #[test]
     fn polygon_nodes_carry_point_coordinates_in_nanometers() {
         let outlines = vec![vec![(1.0, 2.0)]];
-        let s = board_polygon("F.Cu", false, &outlines);
+        let s = board_polygon("F.Cu", 0.0, false, &outlines);
         match s.shape.unwrap().geometry.unwrap() {
             Geometry::Polygon(poly_set) => {
                 let node = &poly_set.polygons[0].outline.as_ref().unwrap().nodes[0];
@@ -453,10 +502,91 @@ mod tests {
 
     #[test]
     fn polygon_empty_outlines_produces_empty_polyset() {
-        let s = board_polygon("F.SilkS", true, &[]);
+        let s = board_polygon("F.SilkS", 0.0, true, &[]);
         match s.shape.unwrap().geometry.unwrap() {
             Geometry::Polygon(poly_set) => assert!(poly_set.polygons.is_empty()),
             _ => panic!("expected Polygon geometry"),
         }
+    }
+
+    #[test]
+    fn via_is_a_through_via_with_position_drill_size_and_net() {
+        use kiapi::board::types::{BoardLayer, PadStackShape, PadStackType, ViaType};
+
+        let v = build_via("VCC_BATT", 7, 146.268, 89.194, 0.2, 0.45);
+
+        // Position, in nanometers.
+        let pos = v.position.expect("position");
+        assert_eq!(pos.x_nm, 146_268_000);
+        assert_eq!(pos.y_nm, 89_194_000);
+
+        // Net carried through.
+        let net = v.net.expect("net");
+        assert_eq!(net.name, "VCC_BATT");
+        assert_eq!(net.code.unwrap().value, 7);
+
+        // Through via (F.Cu → B.Cu), normal pad stack.
+        assert_eq!(v.r#type, ViaType::VtThrough as i32);
+        let ps = v.pad_stack.expect("pad_stack");
+        assert_eq!(ps.r#type, PadStackType::PstNormal as i32);
+        assert_eq!(
+            ps.layers,
+            vec![BoardLayer::BlFCu as i32, BoardLayer::BlBCu as i32]
+        );
+
+        // The drill's start/end layers are what make it a through via.
+        let drill = ps.drill.expect("drill");
+        assert_eq!(drill.start_layer, BoardLayer::BlFCu as i32);
+        assert_eq!(drill.end_layer, BoardLayer::BlBCu as i32);
+        assert_eq!(drill.diameter.unwrap().x_nm, 200_000);
+        assert_eq!(
+            drill.shape,
+            kiapi::board::types::DrillShape::DsCircle as i32,
+            "leaving the drill shape at the proto default (DS_UNKNOWN) is what \
+             the working footprint-pad path avoids"
+        );
+
+        // Exactly one copper entry — see assert_normal_padstack_is_unpackable.
+        assert_eq!(ps.copper_layers.len(), 1);
+        assert_eq!(ps.copper_layers[0].shape, PadStackShape::PssCircle as i32);
+        assert_eq!(ps.copper_layers[0].size.unwrap().x_nm, 450_000);
+
+        assert_normal_padstack_is_unpackable(&ps, "build_via");
+    }
+
+    /// KiCad's own rule, enforceable without a running KiCAD.
+    ///
+    /// `PADSTACK::unpackCopperLayer` bails when `m_mode == MODE::NORMAL` and
+    /// the entry's layer is not `ALL_LAYERS` (`== F_Cu`), which fails the
+    /// enclosing `PCB_VIA::Deserialize` / `PAD::Deserialize` and comes back as
+    /// `AS_BAD_REQUEST "could not unpack …"`. Sending F.Cu *and* B.Cu entries
+    /// is what broke `add_via` in v0.2.1 (#117); the through span belongs to
+    /// the drill, not to the copper list.
+    ///
+    /// Anything constructing a PST_NORMAL padstack should assert this — the
+    /// mock server echoes requests back rather than running KiCad's parser, so
+    /// no transport test can catch a malformed padstack for us.
+    pub(crate) fn assert_normal_padstack_is_unpackable(
+        ps: &kiapi::board::types::PadStack,
+        what: &str,
+    ) {
+        use kiapi::board::types::{BoardLayer, PadStackType};
+
+        if ps.r#type != PadStackType::PstNormal as i32 {
+            return;
+        }
+        assert_eq!(
+            ps.copper_layers.len(),
+            1,
+            "{what}: a PST_NORMAL padstack must carry exactly one copper layer, \
+             got {} — KiCad rejects the whole message",
+            ps.copper_layers.len()
+        );
+        assert_eq!(
+            ps.copper_layers[0].layer,
+            BoardLayer::BlFCu as i32,
+            "{what}: the single copper entry of a PST_NORMAL padstack must be \
+             keyed to F_Cu (KiCad's ALL_LAYERS sentinel)"
+        );
     }
 }

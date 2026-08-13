@@ -5,8 +5,9 @@ on:
     tags:
       - 'v*'
 
-permissions:
-  contents: write
+# Job-level permissions only: the build jobs never need write access, so the
+# `release` job below is the sole holder of contents: write.
+permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,6 +17,9 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
     strategy:
       matrix:
         include:
@@ -33,22 +37,29 @@ jobs:
             archive: zip
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: arduino/setup-protoc@v3
+      # rust-toolchain.toml overrides the action-installed stable with the
+      # pinned toolchain, which only has the host target — cross targets
+      # (x86_64-apple-darwin on arm64 runners) must be added to the ACTIVE
+      # toolchain explicitly or the build dies with E0463 (v0.2.1 lesson).
+      - name: Add matrix target to the pinned toolchain
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }} -p konnect
+        run: cargo build --release --locked --target ${{ matrix.target }} -p konnect
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -64,7 +75,7 @@ jobs:
           Compress-Archive -Path "${{ env.BINARY_NAME }}.exe" -DestinationPath "../../../${{ env.BINARY_NAME }}-${{ github.ref_name }}-${{ matrix.target }}.zip"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.BINARY_NAME }}-${{ matrix.target }}
           path: ${{ env.BINARY_NAME }}-${{ github.ref_name }}-${{ matrix.target }}.*
@@ -72,6 +83,9 @@ jobs:
   pcm-package:
     name: KiCAD PCM plugin package (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -83,7 +97,7 @@ jobs:
           - platform: linux
             os: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -94,29 +108,55 @@ jobs:
         if: matrix.platform == 'macos'
         run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
 
-      - uses: arduino/setup-protoc@v3
+      - uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: pcm-package-${{ matrix.platform }}
 
+      # Tauri 2 needs the GTK/WebKit stack to compile on Linux. Without
+      # these the viewer build fails on glib-sys and (before the require
+      # gate below existed) the Linux zip silently shipped without the
+      # viewer — true of every release up to and including v0.2.0.
+      - name: Install viewer system deps (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev patchelf
+
       - name: Build server binary
         if: matrix.platform != 'macos'
-        run: cargo build --release -p konnect
+        run: cargo build --release --locked -p konnect
 
       - name: Build schematic viewer (optional)
         if: matrix.platform != 'macos'
         continue-on-error: true
-        run: cargo build --release --manifest-path crates/schematic-viewer/Cargo.toml
+        run: cargo build --release --locked --manifest-path crates/schematic-viewer/Cargo.toml
+
+      # continue-on-error above keeps partial logs useful, but a release
+      # artifact must not silently ship without the viewer — the PCM scripts
+      # omit a missing viewer binary without failing.
+      - name: Require viewer binary (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "crates/schematic-viewer/target/release/schematic-viewer.exe")) {
+            Write-Error "schematic-viewer build failed - refusing to package without it"
+            exit 1
+          }
+      - name: Require viewer binary (Linux)
+        if: matrix.platform == 'linux'
+        run: test -f crates/schematic-viewer/target/release/schematic-viewer
 
       - name: Build universal binaries (macOS)
         if: matrix.platform == 'macos'
         run: |
           set -euo pipefail
           for target in aarch64-apple-darwin x86_64-apple-darwin; do
-            cargo build --release -p konnect --target "$target"
+            cargo build --release --locked -p konnect --target "$target"
           done
           mkdir -p dist/universal
           lipo -create -output dist/universal/konnect \
@@ -130,12 +170,16 @@ jobs:
         run: |
           set -euo pipefail
           for target in aarch64-apple-darwin x86_64-apple-darwin; do
-            cargo build --release --manifest-path crates/schematic-viewer/Cargo.toml --target "$target"
+            cargo build --release --locked --manifest-path crates/schematic-viewer/Cargo.toml --target "$target"
           done
           lipo -create -output dist/universal/schematic-viewer \
             crates/schematic-viewer/target/aarch64-apple-darwin/release/schematic-viewer \
             crates/schematic-viewer/target/x86_64-apple-darwin/release/schematic-viewer
           lipo -info dist/universal/schematic-viewer
+
+      - name: Require viewer binary (macOS)
+        if: matrix.platform == 'macos'
+        run: test -f dist/universal/schematic-viewer
 
       - name: Assemble PCM package (Windows)
         if: matrix.platform == 'windows'
@@ -168,17 +212,21 @@ jobs:
 
       # Gate: the package must declare the platform it carries, and the bundled
       # binary must actually be that platform's executable format.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
       - name: Validate PCM package against KiCAD schema (release gate)
         shell: bash
         run: |
           set -euo pipefail
-          pip install jsonschema
+          python -m pip install jsonschema
           version="${GITHUB_REF_NAME#v}"
           python packaging/validate-pcm.py \
             --zip "dist/konnect-pcm-v$version-${{ matrix.platform }}.zip"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: konnect-pcm-${{ matrix.platform }}
           path: dist/konnect-pcm-*.zip
@@ -187,14 +235,17 @@ jobs:
     name: Create Release
     needs: [build, pcm-package]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: artifacts/*
           generate_release_notes: true

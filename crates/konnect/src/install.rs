@@ -403,8 +403,10 @@ pub fn detect_kicad() -> Option<PathBuf> {
     // Standard paths (check these first — faster than registry)
     #[cfg(target_os = "windows")]
     let standard_paths: Vec<PathBuf> = [
+        r"C:\KiCad\10.0\bin\kicad-cli.exe",
         r"C:\Program Files\KiCad\10.0\bin\kicad-cli.exe",
         r"C:\Program Files (x86)\KiCad\10.0\bin\kicad-cli.exe",
+        r"C:\KiCad\9.0\bin\kicad-cli.exe",
         r"C:\Program Files\KiCad\9.0\bin\kicad-cli.exe",
         r"C:\Program Files (x86)\KiCad\9.0\bin\kicad-cli.exe",
     ]

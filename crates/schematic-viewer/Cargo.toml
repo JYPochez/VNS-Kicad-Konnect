@@ -1,6 +1,6 @@
 [package]
 name = "schematic-viewer"
-version = "0.2.0"
+version = "0.2.2"
 license = "AGPL-3.0-only"
 edition = "2021"
 publish = false
@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 tauri = { version = "2", features = [] }
-notify = "7"
+notify = "8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

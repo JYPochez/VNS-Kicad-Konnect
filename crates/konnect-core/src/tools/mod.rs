@@ -328,6 +328,139 @@ pub fn ensure_root_uuid(sch: &mut konnect_schematic_editor::Schematic) -> String
     }
 }
 
+/// All symbol pin connection points in a parsed schematic tree.
+///
+/// Unit-aware: a multi-unit library symbol superimposes every unit's pins on
+/// one placement, so an instance of unit 1 must not report unit 2's pins (#35).
+/// These coordinates drive junction insertion, and a dot dropped on a phantom
+/// pin where two wires cross would short them.
+pub(crate) fn all_pin_endpoints(tree: &konnect_sexp::SexpNode) -> Vec<(f64, f64)> {
+    use konnect_sexp::schematic::{
+        extract_lib_pins_for_unit, extract_symbol_instances, pin_endpoint,
+    };
+    let lib_syms = tree
+        .find("lib_symbols")
+        .map(|n| n.find_all("symbol"))
+        .unwrap_or_default();
+    let mut pts = Vec::new();
+    for inst in extract_symbol_instances(tree) {
+        if let Some(sym) = lib_syms
+            .iter()
+            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))
+        {
+            let t = inst.pin_transform();
+            for pin in extract_lib_pins_for_unit(sym, inst.unit) {
+                pts.push(pin_endpoint(&pin, t));
+            }
+        }
+    }
+    pts
+}
+
+/// Add junction dots for pins of `reference` that land mid-segment on a wire.
+/// KiCad connects a pin mid-wire only through a junction dot (verified with
+/// kicad-cli 10: a junction alone connects; splitting the wire is unnecessary).
+/// Returns the junction positions added.
+pub(crate) fn add_pin_midwire_junctions(
+    sch_path: &std::path::Path,
+    reference: &str,
+) -> anyhow::Result<Vec<(f64, f64)>> {
+    use konnect_sexp::geometry::{point_on_segment, points_coincident};
+    use konnect_sexp::schematic::{
+        extract_junctions, extract_lib_pins_for_unit, extract_symbol_instances, extract_wires,
+        pin_endpoint, read_schematic,
+    };
+    let tol = 0.01;
+    let (_, tree) = read_schematic(sch_path)?;
+    let wires = extract_wires(&tree);
+    if wires.is_empty() {
+        return Ok(Vec::new());
+    }
+    let junctions = extract_junctions(&tree);
+    let lib_syms = tree
+        .find("lib_symbols")
+        .map(|n| n.find_all("symbol"))
+        .unwrap_or_default();
+    let mut to_add: Vec<(f64, f64)> = Vec::new();
+    for inst in extract_symbol_instances(&tree)
+        .iter()
+        .filter(|i| i.reference == reference)
+    {
+        let Some(sym) = lib_syms
+            .iter()
+            .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))
+        else {
+            continue;
+        };
+        let t = inst.pin_transform();
+        // Unit-aware for the same reason as all_pin_endpoints: this one writes
+        // to the user's file, so a phantom-pin junction is a real defect.
+        for pin in extract_lib_pins_for_unit(sym, inst.unit) {
+            let (px, py) = pin_endpoint(&pin, t);
+            let mid_wire = wires.iter().any(|w| {
+                point_on_segment(px, py, w.x1, w.y1, w.x2, w.y2, tol)
+                    && !points_coincident(px, py, w.x1, w.y1, tol)
+                    && !points_coincident(px, py, w.x2, w.y2, tol)
+            });
+            let already = junctions
+                .iter()
+                .chain(to_add.iter())
+                .any(|(jx, jy)| points_coincident(px, py, *jx, *jy, tol));
+            if mid_wire && !already {
+                to_add.push((px, py));
+            }
+        }
+    }
+    if !to_add.is_empty() {
+        let mut sch = konnect_schematic_editor::Schematic::load(sch_path)?;
+        for &(x, y) in &to_add {
+            sch.add_junction(x, y);
+        }
+        sch.overwrite()?;
+    }
+    Ok(to_add)
+}
+
+/// A symbol-instance property positioned in absolute sheet coordinates, with
+/// eeschema's default 1.27mm font. The `(at)` node is mandatory: a property
+/// written without one is defaulted to the sheet origin by KiCAD, which is how
+/// every `#PWR` reference used to pile up in the top-left corner (PR #95).
+///
+/// Hidden properties get KiCAD 10's property-level `(hide yes)` — a sibling
+/// before `(effects)`, exactly as eeschema writes instances (PR #96); the
+/// legacy hide-inside-effects form renders the same but round-trips dirty.
+pub(crate) fn positioned_property(
+    name: &str,
+    value: &str,
+    x: f64,
+    y: f64,
+    rotation: f64,
+    hide: bool,
+) -> konnect_schematic_editor::Property {
+    use konnect_schematic_editor::sexp::{atom, SexpNode};
+    use konnect_schematic_editor::types::fmt_f64;
+
+    let mut prop = konnect_schematic_editor::Property::new(name, value);
+    prop.sub_nodes.push(SexpNode::List(vec![
+        atom("at"),
+        atom(fmt_f64(x)),
+        atom(fmt_f64(y)),
+        atom(fmt_f64(rotation)),
+    ]));
+    if hide {
+        prop.sub_nodes
+            .push(SexpNode::List(vec![atom("hide"), atom("yes")]));
+    }
+    prop.sub_nodes.push(SexpNode::List(vec![
+        atom("effects"),
+        SexpNode::List(vec![
+            atom("font"),
+            SexpNode::List(vec![atom("size"), atom("1.27"), atom("1.27")]),
+        ]),
+    ]));
+    prop
+}
+
 // ─── Schematic text helpers ──────────────────────────────────────────────────
 
 /// Byte range of the placed `(symbol …)` block whose Reference property is
@@ -625,8 +758,13 @@ pub fn ensure_lib_symbol_in_schematic(content: &mut String, lib_id: &str) -> boo
         return true;
     }
 
-    // Resolve the symbol from KiCAD libraries
-    let sym_def = match resolve_lib_symbol(lib_id) {
+    // Resolve the symbol from KiCAD libraries. Prefer the flattened resolver:
+    // derived symbols ((extends "Parent")) must be embedded with the parent's
+    // units copied in, not as a stub kicad-cli can't netlist (#35). Fall back
+    // to the local raw resolver for parity with the pre-flattening behavior.
+    let sym_def = match konnect_schematic_editor::library::resolve_lib_symbol_flattened(lib_id)
+        .or_else(|| resolve_lib_symbol(lib_id))
+    {
         Some(s) => s,
         None => return false,
     };
@@ -671,61 +809,122 @@ pub fn ensure_lib_symbol_in_schematic(content: &mut String, lib_id: &str) -> boo
     true
 }
 
-/// Find directories where KiCAD symbol libraries are stored.
-fn find_kicad_symbol_dirs() -> Vec<std::path::PathBuf> {
-    let mut dirs = Vec::new();
-    if let Ok(dir) = std::env::var("KICAD10_SYMBOL_DIR") {
-        let p = std::path::PathBuf::from(&dir);
-        if p.is_dir() {
-            dirs.push(p);
-        }
-    }
+/// Roots under which KiCAD ships its bundled libraries — the directory that
+/// directly contains `symbols/`, `footprints/` and `3dmodels/`.
+fn kicad_share_roots() -> Vec<std::path::PathBuf> {
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+
     #[cfg(target_os = "windows")]
     {
-        let candidates = [
-            r"C:\KiCad\10.0\share\kicad\symbols",
-            r"C:\Program Files\KiCad\10.0\share\kicad\symbols",
-            r"C:\KiCad\9.0\share\kicad\symbols",
-            r"C:\Program Files\KiCad\9.0\share\kicad\symbols",
-        ];
-        for c in &candidates {
-            let p = std::path::PathBuf::from(c);
-            if p.is_dir() && !dirs.contains(&p) {
-                dirs.push(p);
-            }
+        // Keep these majors in step with the ones find_kicad_library_dirs
+        // reads environment variables for. A major listed there but missing
+        // here is invisible on any machine where KiCad did not export its
+        // variable — which is every machine where Konnect was not launched
+        // by KiCad.
+        for c in [
+            r"C:\KiCad\10.0\share\kicad",
+            r"C:\Program Files\KiCad\10.0\share\kicad",
+            r"C:\KiCad\9.0\share\kicad",
+            r"C:\Program Files\KiCad\9.0\share\kicad",
+            r"C:\KiCad\8.0\share\kicad",
+            r"C:\Program Files\KiCad\8.0\share\kicad",
+        ] {
+            roots.push(std::path::PathBuf::from(c));
         }
     }
     #[cfg(target_os = "macos")]
     {
         // KiCad on macOS ships its libraries inside the app bundle.
-        let mut candidates = vec![
-            std::path::PathBuf::from(
-                "/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols",
-            ),
-            std::path::PathBuf::from("/usr/local/share/kicad/symbols"),
-        ];
+        roots.push(std::path::PathBuf::from(
+            "/Applications/KiCad/KiCad.app/Contents/SharedSupport",
+        ));
+        roots.push(std::path::PathBuf::from("/usr/local/share/kicad"));
+        // Homebrew (Apple Silicon prefix)
+        roots.push(std::path::PathBuf::from("/opt/homebrew/share/kicad"));
         if let Ok(home) = std::env::var("HOME") {
             // Per-user install (KiCad.app dragged into ~/Applications)
-            candidates.push(
+            roots.push(
                 std::path::PathBuf::from(home)
-                    .join("Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols"),
+                    .join("Applications/KiCad/KiCad.app/Contents/SharedSupport"),
             );
-        }
-        for p in candidates {
-            if p.is_dir() && !dirs.contains(&p) {
-                dirs.push(p);
-            }
         }
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        let candidates = ["/usr/share/kicad/symbols", "/usr/local/share/kicad/symbols"];
-        for c in &candidates {
-            let p = std::path::PathBuf::from(c);
-            if p.is_dir() && !dirs.contains(&p) {
-                dirs.push(p);
+        roots.push(std::path::PathBuf::from("/usr/share/kicad"));
+        roots.push(std::path::PathBuf::from("/usr/local/share/kicad"));
+        roots.push(std::path::PathBuf::from("/opt/kicad/share/kicad"));
+        // Flatpak: system-wide and per-user installs
+        roots.push(std::path::PathBuf::from(
+            "/var/lib/flatpak/app/org.kicad.KiCad/current/active/files/share/kicad",
+        ));
+        if let Ok(home) = std::env::var("HOME") {
+            roots.push(
+                std::path::PathBuf::from(&home).join(
+                    ".local/share/flatpak/app/org.kicad.KiCad/current/active/files/share/kicad",
+                ),
+            );
+        }
+        // Snap
+        roots.push(std::path::PathBuf::from(
+            "/snap/kicad/current/usr/share/kicad",
+        ));
+    }
+
+    roots.retain(|p| p.is_dir());
+    roots
+}
+
+/// Find directories holding a bundled KiCAD library kind — `"symbols"`,
+/// `"footprints"` or `"3dmodels"`.
+///
+/// The matching environment variable wins when KiCad has exported it (it does
+/// so for plugins); otherwise the well-known install locations are searched,
+/// newest KiCad first. The names are not a plain uppercasing of `kind` — they
+/// are singular, and the 3D one is not a word:
+///
+/// | `kind`        | variable                |
+/// |---------------|-------------------------|
+/// | `symbols`     | `KICAD<major>_SYMBOL_DIR`    |
+/// | `footprints`  | `KICAD<major>_FOOTPRINT_DIR` |
+/// | `3dmodels`    | `KICAD<major>_3DMODEL_DIR`   |
+pub(crate) fn find_kicad_library_dirs(kind: &str) -> Vec<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    let mut push = |p: std::path::PathBuf| {
+        if p.is_dir() && !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    };
+
+    if let Some(suffix) = kicad_env_suffix(kind) {
+        for major in ["10", "9", "8"] {
+            // var_os, not var: a directory whose name is not valid Unicode is
+            // still a directory KiCad may have pointed us at, and `var` reports
+            // those as absent — silently falling back to the install roots, or
+            // to nothing, on exactly the machines where the variable was the
+            // only correct answer.
+            if let Some(dir) = std::env::var_os(format!("KICAD{major}_{suffix}")) {
+                push(std::path::PathBuf::from(dir));
             }
         }
     }
+    for root in kicad_share_roots() {
+        push(root.join(kind));
+    }
     dirs
+}
+
+/// The `KICAD<major>_…` environment-variable suffix naming a library kind.
+fn kicad_env_suffix(kind: &str) -> Option<&'static str> {
+    match kind {
+        "symbols" => Some("SYMBOL_DIR"),
+        "footprints" => Some("FOOTPRINT_DIR"),
+        "3dmodels" => Some("3DMODEL_DIR"),
+        _ => None,
+    }
+}
+
+/// Find directories where KiCAD symbol libraries are stored.
+fn find_kicad_symbol_dirs() -> Vec<std::path::PathBuf> {
+    find_kicad_library_dirs("symbols")
 }

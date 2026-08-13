@@ -13,12 +13,12 @@ use konnect_sexp::{
     geometry::snap_point,
     parser::parse_sexp,
     schematic::{
-        extract_lib_pins, extract_symbol_instances, extract_wires, find_t_junctions,
-        format_junction, format_wire, parse_at, pin_endpoint, read_schematic,
+        extract_symbol_instances, extract_wires, find_t_junctions, format_junction, format_wire,
+        parse_at, pin_endpoint, read_schematic,
     },
     writer::{
         apply_edits, find_balanced_block, find_block_starts, find_block_with_leading_whitespace,
-        write_atomic, SexpEdit,
+        find_direct_child_blocks, find_enclosing_block, write_atomic, SexpEdit,
     },
 };
 use serde_json::json;
@@ -65,13 +65,16 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "delete_schematic_wire",
-            "Delete a wire segment by its UUID or by matching its start/end coordinates.",
+            "Delete a wire segment by its UUID, or by matching BOTH endpoints \
+             (all four of x1/y1/x2/y2, either direction). Fails without deleting \
+             anything when no wire matches.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
                     "uuid": { "type": "string", "description": "Wire UUID (preferred)" },
-                    "x1": { "type": "number" }, "y1": { "type": "number" },
+                    "x1": { "type": "number", "description": "Endpoint 1 X in mm (required with y1/x2/y2 when no uuid)" },
+                    "y1": { "type": "number" },
                     "x2": { "type": "number" }, "y2": { "type": "number" }
                 },
                 "required": ["schematic"]
@@ -93,7 +96,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "split_wire_at_point",
-            "Split a wire at a given point, creating two wire segments and a junction.",
+            "Split a wire at a given point, creating two wire segments and a junction. \
+             Note: a pin landing mid-wire only needs a junction dot to connect \
+             (see add_junction) — splitting the wire is not required.",
             json!({
                 "type": "object",
                 "properties": {
@@ -259,7 +264,9 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_junction",
-            "Add a junction dot at a point where wires cross or T-intersect.",
+            "Add a junction dot at a point where wires cross or T-intersect, or where \
+             a pin lands mid-wire. A junction alone connects a mid-wire pin; \
+             splitting the wire is not required.",
             json!({
                 "type": "object",
                 "properties": {
@@ -373,18 +380,11 @@ fn insert_before_close(content: &str, new_sexp: &str) -> String {
 /// Top-level instances have `(lib_id` as a child, while lib_symbols definitions don't.
 /// Returns the position where wires/labels should be inserted BEFORE.
 fn find_first_symbol_instance(content: &str) -> Option<usize> {
-    // Pattern: a symbol instance always contains (lib_id "...") shortly after (symbol
-    // lib_symbols definitions contain sub-symbols but NOT (lib_id
-    let mut pos = 0;
-    while let Some(found) = content[pos..].find("\n  (symbol") {
-        let abs = pos + found;
-        // Check if this symbol block contains (lib_id within the next ~200 chars
-        let lookahead = &content[abs..content.len().min(abs + 200)];
-        if lookahead.contains("(lib_id ") {
-            // This is a top-level symbol instance, not a lib_symbols definition
-            return Some(abs + 1); // +1 to skip the \n
+    for (start, end) in find_direct_child_blocks(content, "kicad_sch") {
+        let block = &content[start..end];
+        if block.starts_with("(symbol") && block.contains("(lib_id ") {
+            return Some(start);
         }
-        pos = abs + 1;
     }
     None
 }
@@ -406,10 +406,38 @@ fn cse_wires_to_sexp(sch: &cse::Schematic) -> Vec<konnect_sexp::schematic::Wire>
 
 // ─── Wire insertion with T-junction detection ─────────────────────────────────
 
-fn insert_wire_with_junctions(content: String, x1: f64, y1: f64, x2: f64, y2: f64) -> String {
+/// Pin endpoints that lie strictly inside a wire segment. Each needs a
+/// junction dot: KiCad connects a mid-wire pin only through a junction
+/// (verified with kicad-cli 10 — no wire split required).
+fn pins_mid_segment(pins: &[(f64, f64)], x1: f64, y1: f64, x2: f64, y2: f64) -> Vec<(f64, f64)> {
+    let tol = 0.01;
+    pins.iter()
+        .copied()
+        .filter(|&(px, py)| {
+            konnect_sexp::geometry::point_on_segment(px, py, x1, y1, x2, y2, tol)
+                && !konnect_sexp::geometry::points_coincident(px, py, x1, y1, tol)
+                && !konnect_sexp::geometry::points_coincident(px, py, x2, y2, tol)
+        })
+        .collect()
+}
+
+pub(crate) fn insert_wire_with_junctions(
+    content: String,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+) -> String {
     // Parse existing wires to detect new T-junctions
     let tree = konnect_sexp::parse_sexp(&content).ok();
     let mut existing_wires = tree.as_ref().map(extract_wires).unwrap_or_default();
+
+    // Existing junction positions, so a hit already marked isn't re-inserted
+    // (L-bends, and any loop calling this repeatedly, would otherwise double it).
+    let existing_junctions = tree
+        .as_ref()
+        .map(konnect_sexp::schematic::extract_junctions)
+        .unwrap_or_default();
 
     // Add the new wire to the set before checking junctions (it may form T's too)
     let new_wire = konnect_sexp::schematic::Wire {
@@ -421,14 +449,46 @@ fn insert_wire_with_junctions(content: String, x1: f64, y1: f64, x2: f64, y2: f6
     };
     existing_wires.push(new_wire);
 
-    let junctions = find_t_junctions(&existing_wires, 0.01);
+    let mut junctions = find_t_junctions(&existing_wires, 0.01);
+    // Existing pins the new wire passes over also need junction dots.
+    let pins = tree
+        .as_ref()
+        .map(crate::tools::all_pin_endpoints)
+        .unwrap_or_default();
+    for (px, py) in pins_mid_segment(&pins, x1, y1, x2, y2) {
+        if !junctions
+            .iter()
+            .any(|&(jx, jy)| konnect_sexp::geometry::points_coincident(px, py, jx, jy, 0.01))
+        {
+            junctions.push((px, py));
+        }
+    }
 
     let mut c = content;
     c = insert_before_close(&c, &format_wire(x1, y1, x2, y2));
     for (jx, jy) in junctions {
+        if existing_junctions
+            .iter()
+            .any(|(ex, ey)| konnect_sexp::geometry::points_coincident(jx, jy, *ex, *ey, 0.01))
+        {
+            continue;
+        }
         c = insert_before_close(&c, &format_junction(jx, jy));
     }
     c
+}
+
+/// Route a wire between two points: a single straight wire when axis-aligned,
+/// otherwise an H-then-V L-bend, each leg going through T-junction detection.
+pub(crate) fn route_between(content: String, x1: f64, y1: f64, x2: f64, y2: f64) -> String {
+    if (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01 {
+        insert_wire_with_junctions(content, x1, y1, x2, y2)
+    } else {
+        let mid_x = x2;
+        let mid_y = y1;
+        let content = insert_wire_with_junctions(content, x1, y1, mid_x, mid_y);
+        insert_wire_with_junctions(content, mid_x, mid_y, x2, y2)
+    }
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -475,6 +535,18 @@ async fn handle_add_wire(
     for (jx, jy) in &junctions {
         sch.add_junction(*jx, *jy);
     }
+    // Pins the new wire passes over mid-segment also need junction dots.
+    let (_, tree) = read_schematic(&sch_path)?;
+    let pins = crate::tools::all_pin_endpoints(&tree);
+    for (px, py) in pins_mid_segment(&pins, x1, y1, x2, y2) {
+        if !sch
+            .junctions
+            .iter()
+            .any(|j| konnect_sexp::geometry::points_coincident(px, py, j.x, j.y, 0.01))
+        {
+            sch.add_junction(px, py);
+        }
+    }
     sch.overwrite()?;
 
     Ok(CallToolResult::json(
@@ -491,6 +563,11 @@ async fn handle_batch_add_wire(
 
     let mut sch = cse::Schematic::load(&sch_path)?;
     let mut added = 0usize;
+
+    // Pin endpoints are fixed for the whole batch (only wires change below).
+    let pins = read_schematic(&sch_path)
+        .map(|(_, tree)| crate::tools::all_pin_endpoints(&tree))
+        .unwrap_or_default();
 
     for w in &wires {
         let x1 = w["x1"].as_f64().unwrap_or(0.0);
@@ -515,6 +592,16 @@ async fn handle_batch_add_wire(
         for (jx, jy) in &junctions {
             sch.add_junction(*jx, *jy);
         }
+        // Pins this wire passes over mid-segment also need junction dots.
+        for (px, py) in pins_mid_segment(&pins, x1, y1, x2, y2) {
+            if !sch
+                .junctions
+                .iter()
+                .any(|j| konnect_sexp::geometry::points_coincident(px, py, j.x, j.y, 0.01))
+            {
+                sch.add_junction(px, py);
+            }
+        }
         added += 1;
     }
 
@@ -529,25 +616,45 @@ async fn handle_delete_wire(
     let sch_path = get_path(args, "schematic")?;
     let content = std::fs::read_to_string(&sch_path)?;
 
-    let search_str = if let Some(uuid) = opt_str(args, "uuid") {
-        format!(r#"(uuid "{uuid}")"#)
+    let delete_range = if let Some(uuid) = opt_str(args, "uuid") {
+        let search = format!(r#"(uuid "{uuid}")"#);
+        let Some(wire_offset) = content.find(&search) else {
+            return Ok(CallToolResult::error(format!(
+                "Wire UUID '{uuid}' not found"
+            )));
+        };
+        wire_block_with_leading_whitespace(&content, wire_offset)
     } else {
-        let x1 = opt_f64(args, "x1").unwrap_or(0.0);
-        let y1 = opt_f64(args, "y1").unwrap_or(0.0);
-        format!("(start {x1} {y1})")
+        let Some(x1) = opt_f64(args, "x1") else {
+            return Ok(CallToolResult::error(
+                "Provide either uuid or all x1/y1/x2/y2 coordinates",
+            ));
+        };
+        let Some(y1) = opt_f64(args, "y1") else {
+            return Ok(CallToolResult::error(
+                "Provide either uuid or all x1/y1/x2/y2 coordinates",
+            ));
+        };
+        let Some(x2) = opt_f64(args, "x2") else {
+            return Ok(CallToolResult::error(
+                "Provide either uuid or all x1/y1/x2/y2 coordinates",
+            ));
+        };
+        let Some(y2) = opt_f64(args, "y2") else {
+            return Ok(CallToolResult::error(
+                "Provide either uuid or all x1/y1/x2/y2 coordinates",
+            ));
+        };
+        find_wire_block_by_endpoints(&content, x1, y1, x2, y2)
     };
 
-    let wire_offset = match content.find(&search_str) {
-        Some(o) => o,
-        None => return Ok(CallToolResult::error("Wire not found")),
-    };
-
-    // Walk back to the (wire ...) block start
-    let before = &content[..wire_offset];
-    let wire_start = before.rfind("\n  (wire").map(|p| p + 1).unwrap_or(0);
-    let (del_start, del_end) = match find_block_with_leading_whitespace(&content, wire_start) {
+    let (del_start, del_end) = match delete_range {
         Some(r) => r,
-        None => return Ok(CallToolResult::error("Cannot parse wire block")),
+        None => {
+            return Ok(CallToolResult::error(
+                "Cannot locate a wire block matching the requested identity",
+            ))
+        }
     };
 
     let edits = vec![SexpEdit::delete(del_start, del_end)];
@@ -568,31 +675,86 @@ async fn handle_batch_delete_wire(
         .filter_map(|v| v.as_str().map(String::from))
         .collect();
 
-    let mut content = std::fs::read_to_string(&sch_path)?;
-    let mut deleted = 0usize;
+    let content = std::fs::read_to_string(&sch_path)?;
+    let mut errors = Vec::new();
 
     // Collect all delete ranges first, then apply in reverse order
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     for uuid in &uuids {
         let search = format!(r#"(uuid "{uuid}")"#);
-        if let Some(offset) = content.find(&search) {
-            let before = &content[..offset];
-            if let Some(wire_start) = before.rfind("\n  (wire").map(|p| p + 1) {
-                if let Some(range) = find_block_with_leading_whitespace(&content, wire_start) {
-                    ranges.push(range);
-                    deleted += 1;
-                }
-            }
+        match content.find(&search) {
+            Some(offset) => match wire_block_with_leading_whitespace(&content, offset) {
+                Some(range) => ranges.push(range),
+                None => errors.push(format!(
+                    "UUID '{uuid}' exists but is not inside a parseable wire block"
+                )),
+            },
+            None => errors.push(format!("Wire UUID '{uuid}' not found")),
         }
+    }
+    ranges.sort_unstable();
+    ranges.dedup();
+    let deleted = ranges.len();
+
+    if deleted == 0 && !uuids.is_empty() {
+        return Ok(CallToolResult::error(format!(
+            "No wires deleted: {}",
+            errors.join("; ")
+        )));
     }
 
     let edits: Vec<SexpEdit> = ranges
         .into_iter()
         .map(|(s, e)| SexpEdit::delete(s, e))
         .collect();
-    content = apply_edits(content, edits);
+    let content = apply_edits(content, edits);
     write_atomic(&sch_path, &content)?;
-    Ok(CallToolResult::json(&json!({ "deleted": deleted })))
+    Ok(CallToolResult::json(&json!({
+        "deleted": deleted,
+        "errors": errors
+    })))
+}
+
+fn wire_block_with_leading_whitespace(
+    content: &str,
+    contained_offset: usize,
+) -> Option<(usize, usize)> {
+    let (wire_start, _) = find_enclosing_block(content, "wire", contained_offset)?;
+    find_block_with_leading_whitespace(content, wire_start)
+}
+
+fn find_wire_block_by_endpoints(
+    content: &str,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+) -> Option<(usize, usize)> {
+    const TOLERANCE: f64 = 1e-6;
+    let same = |a: f64, b: f64| (a - b).abs() <= TOLERANCE;
+
+    for start in find_block_starts(content, "wire") {
+        let Some((block_start, block_end)) = find_balanced_block(content, start) else {
+            continue;
+        };
+        // `extract_wires` expects wires to be direct children of the parsed
+        // document root, so wrap this standalone block in a minimal root.
+        let wrapped = format!("(kicad_sch {})", &content[block_start..block_end]);
+        let Ok(node) = parse_sexp(&wrapped) else {
+            continue;
+        };
+        let matches = extract_wires(&node).into_iter().any(|wire| {
+            (same(wire.x1, x1) && same(wire.y1, y1) && same(wire.x2, x2) && same(wire.y2, y2))
+                || (same(wire.x1, x2)
+                    && same(wire.y1, y2)
+                    && same(wire.x2, x1)
+                    && same(wire.y2, y1))
+        });
+        if matches {
+            return find_block_with_leading_whitespace(content, block_start);
+        }
+    }
+    None
 }
 
 async fn handle_split_wire_at_point(
@@ -632,17 +794,25 @@ async fn handle_split_wire_at_point(
     let del_args = if let Some(uuid) = &w.uuid {
         json!({ "schematic": sch_path.display().to_string(), "uuid": uuid })
     } else {
-        json!({ "schematic": sch_path.display().to_string(), "x1": w.x1, "y1": w.y1 })
+        json!({
+            "schematic": sch_path.display().to_string(),
+            "x1": w.x1,
+            "y1": w.y1,
+            "x2": w.x2,
+            "y2": w.y2
+        })
     };
-    handle_delete_wire(&del_args, ctx).await?;
+    let delete_result = handle_delete_wire(&del_args, ctx).await?;
+    if delete_result.is_error {
+        return Ok(delete_result);
+    }
 
     let content = std::fs::read_to_string(&sch_path)?;
     let w1 = format_wire(w.x1, w.y1, px, py);
     let w2 = format_wire(px, py, w.x2, w.y2);
     let junc = format_junction(px, py);
-    let close = content.rfind(')').unwrap_or(content.len());
-    let edits = vec![SexpEdit::insert(close, format!("{}{}{}", w1, w2, junc))];
-    let new_content = apply_edits(content, edits);
+    let insert = format!("{w1}{w2}{junc}");
+    let new_content = insert_before_close(&content, &insert);
     write_atomic(&sch_path, &new_content)?;
 
     Ok(CallToolResult::json(&json!({
@@ -971,7 +1141,7 @@ async fn handle_rotate_label(
 
 async fn handle_move_labels_by_offset(
     args: &serde_json::Value,
-    ctx: &ToolContext,
+    _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let net = match require_str(args, "net") {
@@ -987,23 +1157,45 @@ async fn handle_move_labels_by_offset(
         Err(e) => return Ok(e),
     };
 
-    let (_, tree) = read_schematic(&sch_path)?;
-    let labels = konnect_sexp::schematic::extract_labels(&tree);
-
-    let matching: Vec<_> = labels.iter().filter(|l| l.net == net).cloned().collect();
-    let mut moved = 0usize;
-
-    for label in &matching {
-        let rotate_args = json!({
-            "schematic": sch_path.display().to_string(),
-            "net": net,
-            "x": label.x + dx,
-            "y": label.y + dy,
-            "rotation": label.rotation
-        });
-        handle_rotate_label(&rotate_args, ctx).await?;
-        moved += 1;
+    let content = std::fs::read_to_string(&sch_path)?;
+    let labels = find_label_blocks(&content);
+    let matching: Vec<&LabelBlock> = labels.iter().filter(|l| l.net == net).collect();
+    if matching.is_empty() {
+        return Ok(CallToolResult::error(format!(
+            "No label named '{}' in this schematic",
+            net
+        )));
     }
+
+    // Edit each label's (at X Y ROT) anchor in place, preserving the rotation.
+    let mut edits = Vec::new();
+    for label in &matching {
+        let (block_start, block_end) = find_balanced_block(&content, label.start)
+            .ok_or_else(|| anyhow::anyhow!("Cannot parse label block"))?;
+        let block = &content[block_start..block_end];
+        let at_rel = block
+            .find("(at ")
+            .ok_or_else(|| anyhow::anyhow!("No (at) in label block"))?;
+        let at_val = block_start + at_rel + "(at ".len();
+        let at_close = content[at_val..]
+            .find(')')
+            .map(|o| at_val + o)
+            .ok_or_else(|| anyhow::anyhow!("Malformed (at)"))?;
+        let rotation = content[at_val..at_close]
+            .split_whitespace()
+            .nth(2)
+            .unwrap_or("0")
+            .to_string();
+        edits.push(SexpEdit::replace(
+            at_val,
+            at_close,
+            format!("{} {} {}", label.x + dx, label.y + dy, rotation),
+        ));
+    }
+
+    let moved = edits.len();
+    let new_content = apply_edits(content, edits);
+    write_atomic(&sch_path, &new_content)?;
 
     Ok(CallToolResult::json(
         &json!({ "moved_labels": moved, "net": net }),
@@ -1077,11 +1269,20 @@ async fn handle_add_power_symbol(
     sym.in_bom = true;
     sym.on_board = true;
     sym.uuid = uuid::Uuid::new_v4().to_string();
+
+    // Property (at …) is absolute sheet coords — same as add_schematic_component.
+    // Bare Property::new writes no (at); KiCad then defaults to (0,0) and every
+    // #PWR piles up in the top-left corner. Hide Reference like eeschema does
+    // (property-level `(hide yes)`, matching what KiCad 10 itself writes).
+    let positioned = crate::tools::positioned_property;
     sym.properties
-        .push(cse::Property::new("Reference", &pwr_ref));
-    sym.properties.push(cse::Property::new("Value", &power_net));
-    sym.properties.push(cse::Property::new("Footprint", ""));
-    sym.properties.push(cse::Property::new("Datasheet", ""));
+        .push(positioned("Reference", &pwr_ref, x, y - 3.81, 0.0, true));
+    sym.properties
+        .push(positioned("Value", &power_net, x, y + 3.81, 0.0, false));
+    sym.properties
+        .push(positioned("Footprint", "", x, y, 0.0, true));
+    sym.properties
+        .push(positioned("Datasheet", "", x, y, 0.0, true));
 
     // Instance entry, keyed to the root sheet UUID like eeschema writes it —
     // without a resolvable "/<root-uuid>" path KiCAD's netlister drops the
@@ -1097,10 +1298,15 @@ async fn handle_add_power_symbol(
     sch.add_symbol(sym);
     sch.overwrite()?;
 
+    // A power pin landing mid-segment on an existing wire needs a junction
+    // dot, or KiCad ERC reports it as not connected.
+    let junctions_added = crate::tools::add_pin_midwire_junctions(&sch_path, &pwr_ref)?;
+
     Ok(CallToolResult::json(&json!({
         "added_power": power_net,
         "reference": pwr_ref,
-        "x": x, "y": y
+        "x": x, "y": y,
+        "junctions_added": junctions_added.iter().map(|(x, y)| json!({"x": x, "y": y})).collect::<Vec<_>>()
     })))
 }
 
@@ -1141,40 +1347,93 @@ async fn handle_delete_no_connect(
     };
 
     let content = std::fs::read_to_string(&sch_path)?;
-    let search = format!("(no_connect (at {x} {y})");
-    let pos = match content.find(&search) {
-        Some(p) => p,
-        None => {
-            return Ok(CallToolResult::error(
-                "No-connect not found at that position",
-            ))
-        }
+    let Some((del_start, del_end)) = find_no_connect_block_at(&content, x, y) else {
+        return Ok(CallToolResult::error(
+            "No-connect not found at that position",
+        ));
     };
-    let (del_start, del_end) = find_block_with_leading_whitespace(&content, pos)
-        .ok_or_else(|| anyhow::anyhow!("Cannot parse no_connect block"))?;
-    let edits = vec![SexpEdit::delete(del_start, del_end)];
-    let new_content = apply_edits(content, edits);
+    let new_content = apply_edits(content, vec![SexpEdit::delete(del_start, del_end)]);
     write_atomic(&sch_path, &new_content)?;
     Ok(CallToolResult::text("No-connect deleted."))
 }
 
+/// Byte range of the `(no_connect …)` block whose `(at …)` is `(x, y)`.
+///
+/// The previous implementation searched for the literal
+/// `"(no_connect (at {x} {y})"`. No-connect blocks are never written on one
+/// line — this crate's writer takes the multi-line branch for any node with
+/// list children, and eeschema does the same with tabs — so that string never
+/// matched anything and both delete tools were inert (#114). Same failure
+/// class as the wire deletion in #64; this reuses the #69 block machinery the
+/// wire path already uses, including its coordinate tolerance.
+fn find_no_connect_block_at(content: &str, x: f64, y: f64) -> Option<(usize, usize)> {
+    const TOLERANCE: f64 = 1e-6;
+    let same = |a: f64, b: f64| (a - b).abs() <= TOLERANCE;
+
+    for start in find_block_starts(content, "no_connect") {
+        let Some((block_start, block_end)) = find_balanced_block(content, start) else {
+            continue;
+        };
+        let Ok(node) = parse_sexp(&content[block_start..block_end]) else {
+            continue;
+        };
+        let Some(at) = node.find("at") else { continue };
+        let (Some(bx), Some(by)) = (at.get_f64(1), at.get_f64(2)) else {
+            continue;
+        };
+        if same(bx, x) && same(by, y) {
+            return find_block_with_leading_whitespace(content, block_start);
+        }
+    }
+    None
+}
+
 async fn handle_batch_delete_no_connect(
     args: &serde_json::Value,
-    ctx: &ToolContext,
+    _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let positions = args["positions"].as_array().cloned().unwrap_or_default();
-    let mut deleted = 0usize;
+
+    // One read, collect every range, one write — matching batch_delete_wire.
+    // The old loop delegated to the single-item handler and counted `.is_ok()`,
+    // but that handler returns `Ok(CallToolResult::error(..))` when nothing
+    // matches, so every failure counted as a success and the tool reported
+    // deletions it had not made (#114).
+    let content = std::fs::read_to_string(&sch_path)?;
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
     for pos in &positions {
-        let del_args = json!({
-            "schematic": sch_path.display().to_string(),
-            "x": pos["x"], "y": pos["y"]
-        });
-        if handle_delete_no_connect(&del_args, ctx).await.is_ok() {
-            deleted += 1;
+        let (Some(x), Some(y)) = (pos["x"].as_f64(), pos["y"].as_f64()) else {
+            errors.push(format!("Position {pos} needs numeric x and y"));
+            continue;
+        };
+        match find_no_connect_block_at(&content, x, y) {
+            Some(range) => ranges.push(range),
+            None => errors.push(format!("No no-connect at ({x}, {y})")),
         }
     }
-    Ok(CallToolResult::json(&json!({ "deleted": deleted })))
+    ranges.sort_unstable();
+    ranges.dedup();
+    let deleted = ranges.len();
+
+    if deleted == 0 && !positions.is_empty() {
+        return Ok(CallToolResult::error(format!(
+            "No no-connects deleted: {}",
+            errors.join("; ")
+        )));
+    }
+
+    let edits: Vec<SexpEdit> = ranges
+        .into_iter()
+        .map(|(s, e)| SexpEdit::delete(s, e))
+        .collect();
+    let content = apply_edits(content, edits);
+    write_atomic(&sch_path, &content)?;
+    Ok(CallToolResult::json(&json!({
+        "deleted": deleted,
+        "errors": errors
+    })))
 }
 
 async fn handle_add_junction(
@@ -1264,6 +1523,19 @@ async fn handle_connect_to_net(
     for (jx, jy) in &junctions {
         sch.add_junction(*jx, *jy);
     }
+    // Pins the stub passes over mid-segment also need junction dots.
+    let pins = read_schematic(&sch_path)
+        .map(|(_, tree)| crate::tools::all_pin_endpoints(&tree))
+        .unwrap_or_default();
+    for (px, py) in pins_mid_segment(&pins, pin_x, pin_y, label_x, label_y) {
+        if !sch
+            .junctions
+            .iter()
+            .any(|j| konnect_sexp::geometry::points_coincident(px, py, j.x, j.y, 0.01))
+        {
+            sch.add_junction(px, py);
+        }
+    }
 
     // Add label
     match label_type {
@@ -1326,17 +1598,7 @@ async fn handle_connect_pins(
     let (x2, y2) = resolve_pin_endpoint(&instances, &lib_syms, &ref2, &pin2)?;
 
     // Route wire(s) between the two pin endpoints
-    let mut new_content = content;
-    if (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01 {
-        // Already axis-aligned: single wire
-        new_content = insert_wire_with_junctions(new_content, x1, y1, x2, y2);
-    } else {
-        // L-bend: horizontal then vertical
-        let mid_x = x2;
-        let mid_y = y1;
-        new_content = insert_wire_with_junctions(new_content.clone(), x1, y1, mid_x, mid_y);
-        new_content = insert_wire_with_junctions(new_content, mid_x, mid_y, x2, y2);
-    }
+    let new_content = route_between(content, x1, y1, x2, y2);
 
     write_atomic(&sch_path, &new_content)?;
 
@@ -1350,7 +1612,7 @@ async fn handle_connect_pins(
 
 /// Resolve a pin's schematic-space endpoint by reference and pin number.
 /// Uses the same pattern as sch_analysis::handle_get_pin_connections.
-fn resolve_pin_endpoint(
+pub(crate) fn resolve_pin_endpoint(
     instances: &[konnect_sexp::schematic::SymbolInstance],
     lib_syms: &[&konnect_sexp::parser::SexpNode],
     reference: &str,
@@ -1365,11 +1627,20 @@ fn resolve_pin_endpoint(
         .find(|n| n.get(1).and_then(|c| c.as_str()) == Some(&inst.lib_id))
         .ok_or_else(|| anyhow::anyhow!("Library symbol '{}' not found", inst.lib_id))?;
 
-    let pins = extract_lib_pins(lib_sym);
+    // Unit-aware (#35): only this instance's unit owns the pin — asking unit 1
+    // of an LM2904 for pin 7 must fail, not wire to a superimposed phantom.
+    let pins = konnect_sexp::schematic::extract_lib_pins_for_unit(lib_sym, inst.unit);
     let lib_pin = pins
         .iter()
         .find(|p| p.number == pin_number)
-        .ok_or_else(|| anyhow::anyhow!("Pin '{}' not found on '{}'", pin_number, reference))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Pin '{}' not found on '{}' (unit {})",
+                pin_number,
+                reference,
+                inst.unit
+            )
+        })?;
 
     Ok(pin_endpoint(lib_pin, inst.pin_transform()))
 }
@@ -1396,23 +1667,153 @@ async fn handle_add_schematic_connection(
         Err(e) => return Ok(e),
     };
 
-    let mut content = std::fs::read_to_string(&sch_path)?;
-
-    if (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01 {
-        // Already axis-aligned: single wire
-        content = insert_wire_with_junctions(content, x1, y1, x2, y2);
-    } else {
-        // Route with an L-bend: H segment then V segment
-        let mid_x = x2;
-        let mid_y = y1;
-        content = insert_wire_with_junctions(content.clone(), x1, y1, mid_x, mid_y);
-        content = insert_wire_with_junctions(content, mid_x, mid_y, x2, y2);
-    }
+    let content = std::fs::read_to_string(&sch_path)?;
+    let content = route_between(content, x1, y1, x2, y2);
 
     write_atomic(&sch_path, &content)?;
     Ok(CallToolResult::json(&json!({
         "connected": { "from": [x1, y1], "to": [x2, y2] }
     })))
+}
+
+#[cfg(test)]
+mod unit_aware_wiring_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// A schematic with an embedded LM2904-style dual op-amp (unit 1 = pins
+    /// 1-3, unit 2 = pins 5-7) placed twice: U1 as unit 1, U2 as unit 2.
+    fn dual_opamp_schematic() -> (tempfile::TempDir, std::path::PathBuf) {
+        let pin = |num: &str, x: f64, y: f64, angle: u32| {
+            format!(
+                "\t\t\t(pin passive line (at {x} {y} {angle}) (length 2.54)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"{num}\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n"
+            )
+        };
+        let lib_sym = format!(
+            "\t\t(symbol \"Test:OP2\"\n\t\t\t(symbol \"OP2_1_1\"\n{}{}{}\t\t\t)\n\t\t\t(symbol \"OP2_2_1\"\n{}{}{}\t\t\t)\n\t\t)\n",
+            pin("1", -7.62, 2.54, 0),
+            pin("2", -7.62, -2.54, 0),
+            pin("3", 7.62, 0.0, 180),
+            pin("5", -7.62, 2.54, 0),
+            pin("6", -7.62, -2.54, 0),
+            pin("7", 7.62, 0.0, 180),
+        );
+        let inst = |reference: &str, unit: u32, x: f64, uuid: &str| {
+            format!(
+                "\t(symbol\n\t\t(lib_id \"Test:OP2\")\n\t\t(at {x} 80 0)\n\t\t(unit {unit})\n\t\t(uuid \"{uuid}\")\n\t\t(property \"Reference\" \"{reference}\"\n\t\t\t(at {x} 75 0)\n\t\t)\n\t)\n"
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dual.kicad_sch");
+        std::fs::write(
+            &path,
+            format!(
+                "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(uuid \"3af69a4c-1faa-40bd-91dc-c4fc245c4cbd\")\n\t(lib_symbols\n{}\t)\n{}{})\n",
+                lib_sym,
+                inst("U1", 1, 100.0, "aaaaaaaa-1111-1111-1111-111111111111"),
+                inst("U2", 2, 150.0, "bbbbbbbb-2222-2222-2222-222222222222"),
+            ),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn connect_pins_uses_the_instance_unit() {
+        let (_d, path) = dual_opamp_schematic();
+
+        // U1 is unit 1: its pins are 1-3. U2 is unit 2: pins 5-7.
+        let ok = handle_connect_pins(
+            &json!({
+                "schematic": path.display().to_string(),
+                "ref1": "U1", "pin1": "1",
+                "ref2": "U2", "pin2": "5"
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !ok.is_error,
+            "unit-owned pins must connect: {:?}",
+            ok.content
+        );
+
+        // Pin 5 belongs to unit 2 — asking for it on the unit-1 instance must
+        // fail instead of wiring to a superimposed phantom position (#35).
+        let err = handle_connect_pins(
+            &json!({
+                "schematic": path.display().to_string(),
+                "ref1": "U1", "pin1": "5",
+                "ref2": "U2", "pin2": "6"
+            }),
+            &test_ctx(),
+        )
+        .await;
+        let msg = format!("{:?}", err);
+        assert!(
+            err.is_err() || err.as_ref().is_ok_and(|r| r.is_error),
+            "pin 5 on a unit-1 instance must not resolve: {msg}"
+        );
+        assert!(
+            msg.contains("unit 1"),
+            "error should name the instance unit: {msg}"
+        );
+    }
+
+    /// U1 has a single pin at (101.6, 76.2) — on the 1.27 grid so add_wire's
+    /// snapping keeps the new wire exactly through it.
+    fn single_pin_schematic() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pin.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n\t(version 20260306)\n\t(generator \"eeschema\")\n\t(uuid \"root\")\n\t(lib_symbols\n\t\t(symbol \"Test:P1\"\n\t\t\t(symbol \"P1_1_1\"\n\t\t\t\t(pin passive line (at 0 0 0) (length 2.54)\n\t\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t\t)\n\t\t\t)\n\t\t)\n\t)\n\t(symbol\n\t\t(lib_id \"Test:P1\")\n\t\t(at 101.6 76.2 0)\n\t\t(unit 1)\n\t\t(uuid \"u1\")\n\t\t(property \"Reference\" \"U1\"\n\t\t\t(at 101.6 71.12 0)\n\t\t)\n\t)\n\t(sheet_instances (path \"/\" (page \"1\")))\n)\n",
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    /// Drawing a wire across an existing pin mid-segment must auto-insert a
+    /// junction dot — KiCad connects a mid-wire pin only through a junction.
+    #[tokio::test]
+    async fn add_wire_over_pin_inserts_junction() {
+        let (_d, path) = single_pin_schematic();
+        let result = handle_add_wire(
+            &json!({
+                "schematic": path.display().to_string(),
+                "x1": 96.52, "y1": 76.2, "x2": 106.68, "y2": 76.2
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let after = std::fs::read_to_string(&path).unwrap();
+        let tree = konnect_sexp::parse_sexp(&after).unwrap();
+        let juncs = konnect_sexp::schematic::extract_junctions(&tree);
+        assert!(
+            juncs
+                .iter()
+                .any(|&(x, y)| (x - 101.6).abs() < 0.01 && (y - 76.2).abs() < 0.01),
+            "junction expected at the mid-wire pin, got {juncs:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1661,5 +2062,398 @@ mod label_tests {
         let (_d, path) = sch_with(TWO_PLAIN);
         let result = rotate(&path, "VCC", 555.0, 555.0, 180.0).await;
         assert!(result.is_error, "must not rotate the nearest label instead");
+    }
+
+    // ─── move by offset ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn move_labels_by_offset_actually_moves_every_matching_label() {
+        let (_d, path) = sch_with(TWO_PLAIN);
+        let result = handle_move_labels_by_offset(
+            &json!({ "schematic": path.display().to_string(), "net": "VCC", "dx": 2.54, "dy": -1.27 }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("(at 102.54 98.73 0)"),
+            "first label moved: {after}"
+        );
+        assert!(
+            after.contains("(at 202.54 98.73 0)"),
+            "second label moved: {after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_labels_by_offset_errors_on_unknown_net() {
+        let (_d, path) = sch_with(TWO_PLAIN);
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = handle_move_labels_by_offset(
+            &json!({ "schematic": path.display().to_string(), "net": "NOPE", "dx": 1.0, "dy": 1.0 }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "zero matches must not report success");
+        assert_eq!(before, std::fs::read_to_string(&path).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod wire_delete_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    const WIRE_1: &str = "11111111-1111-1111-1111-111111111111";
+    const WIRE_2: &str = "22222222-2222-2222-2222-222222222222";
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    fn tab_indented_schematic() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wire-delete.kicad_sch");
+        std::fs::write(
+            &path,
+            format!(
+                "(kicad_sch\n\t(version 20260306)\n\t(generator \"eeschema\")\n\t(generator_version \"10.0\")\n\t(uuid \"00000000-0000-0000-0000-000000000001\")\n\t(paper \"A4\")\n\t(wire\n\t\t(pts\n\t\t\t(xy 50.8 50.8) (xy 60.96 50.8)\n\t\t)\n\t\t(stroke (width 0) (type default))\n\t\t(uuid \"{WIRE_1}\")\n\t)\n\t(wire\n\t\t(pts\n\t\t\t(xy 50.8 60.96) (xy 60.96 60.96)\n\t\t)\n\t\t(stroke (width 0) (type default))\n\t\t(uuid \"{WIRE_2}\")\n\t)\n\t(sheet_instances\n\t\t(path \"/\" (page \"1\"))\n\t)\n)\n"
+            ),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn delete_wire_preserves_tab_indented_schematic_and_neighbors() {
+        let (_dir, path) = tab_indented_schematic();
+        let result = handle_delete_wire(
+            &json!({ "schematic": path.display().to_string(), "uuid": WIRE_1 }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(!after.contains(WIRE_1));
+        assert!(after.contains(WIRE_2));
+        assert!(after.contains("(sheet_instances"));
+        assert!(konnect_sexp::parse_sexp(&after).is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_wire_matches_reversed_endpoint_coordinates() {
+        let (_dir, path) = tab_indented_schematic();
+        let result = handle_delete_wire(
+            &json!({
+                "schematic": path.display().to_string(),
+                "x1": 60.96,
+                "y1": 50.8,
+                "x2": 50.8,
+                "y2": 50.8
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(!after.contains(WIRE_1));
+        assert!(after.contains(WIRE_2));
+        assert!(konnect_sexp::parse_sexp(&after).is_ok());
+    }
+
+    #[tokio::test]
+    async fn batch_delete_wire_handles_tabs_and_duplicate_requests() {
+        let (_dir, path) = tab_indented_schematic();
+        let result = handle_batch_delete_wire(
+            &json!({
+                "schematic": path.display().to_string(),
+                "uuids": [WIRE_1, WIRE_1, WIRE_2]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(!after.contains(WIRE_1));
+        assert!(!after.contains(WIRE_2));
+        assert!(after.contains("(sheet_instances"));
+        assert!(konnect_sexp::parse_sexp(&after).is_ok());
+    }
+
+    #[tokio::test]
+    async fn batch_delete_wire_fails_closed_when_nothing_matches() {
+        let (_dir, path) = tab_indented_schematic();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = handle_batch_delete_wire(
+            &json!({
+                "schematic": path.display().to_string(),
+                "uuids": ["ffffffff-ffff-ffff-ffff-ffffffffffff"]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn split_wire_without_uuid_deletes_by_complete_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wire-split.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n\t(version 20260306)\n\t(generator \"eeschema\")\n\t(wire\n\t\t(pts (xy 0 0) (xy 10 0))\n\t\t(stroke (width 0) (type default))\n\t)\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_split_wire_at_point(
+            &json!({
+                "schematic": path.display().to_string(),
+                "x": 5.0,
+                "y": 0.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        let parsed = konnect_sexp::parse_sexp(&after).unwrap();
+        let wires = extract_wires(&parsed);
+        assert_eq!(wires.len(), 2);
+        assert!(after.contains("(junction"));
+        assert!(!wires.iter().any(|wire| wire.x1 == 0.0 && wire.x2 == 10.0));
+    }
+}
+
+#[cfg(test)]
+mod power_symbol_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn add_power_symbol_places_hidden_reference_near_the_symbol() {
+        // Pre-seed lib_symbols so ensure_lib_symbol succeeds without a KiCad install.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("power.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 0 0))\n      (property \"Value\" \"GND\" (at 0 0 0))\n    )\n  )\n)\n",
+        )
+        .unwrap();
+
+        let result = handle_add_power_symbol(
+            &json!({
+                "schematic": path.display().to_string(),
+                "power_net": "GND",
+                "x": 100.0,
+                "y": 80.0
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        let sch = cse::Schematic::load(&path).unwrap();
+        let sym = sch
+            .symbols
+            .iter()
+            .find(|s| s.reference() == Some("#PWR001"))
+            .expect("power symbol instance");
+        let ref_prop = sym
+            .properties
+            .iter()
+            .find(|p| p.name == "Reference")
+            .unwrap();
+        let ref_sexp = cse::sexp::writer::write(&ref_prop.to_sexp());
+        assert!(
+            ref_sexp.contains("(at 100") && ref_sexp.contains("76.19"),
+            "Reference must sit near the symbol, not sheet origin: {ref_sexp}"
+        );
+        let hide_at = ref_sexp
+            .find("(hide yes)")
+            .expect("KiCad 10 property-level hide");
+        let effects_at = ref_sexp.find("(effects").expect("effects");
+        assert!(
+            hide_at < effects_at,
+            "hide must be a property sibling before effects (not inside effects): {ref_sexp}"
+        );
+        let val_prop = sym.properties.iter().find(|p| p.name == "Value").unwrap();
+        let val_sexp = cse::sexp::writer::write(&val_prop.to_sexp());
+        assert!(
+            val_sexp.contains("(at 100") && val_sexp.contains("83.81"),
+            "Value must sit near the symbol: {val_sexp}"
+        );
+        assert!(
+            !val_sexp.contains("hide"),
+            "Value must stay visible on power symbols: {val_sexp}"
+        );
+        assert!(
+            !after.contains("(property \"Reference\" \"#PWR001\")\n"),
+            "must not write a bare Reference with no (at)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod no_connect_delete_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// Tab-indented, multi-line no-connects — the shape eeschema and this
+    /// crate's own writer both produce. The old literal-string search looked
+    /// for `(no_connect (at X Y)` on one line, which no real file contains.
+    fn schematic_with_two_no_connects() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nc.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch
+	(version 20250610)
+	(generator \"eeschema\")
+	(uuid \"root\")
+	(paper \"A4\")
+	(no_connect
+		(at 127 63.5)
+		(uuid \"nc-1\")
+	)
+	(no_connect
+		(at 140 70)
+		(uuid \"nc-2\")
+	)
+)
+",
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn delete_no_connect_removes_a_multiline_block() {
+        let (_d, path) = schematic_with_two_no_connects();
+        let result = handle_delete_no_connect(
+            &json!({ "schematic": path.display().to_string(), "x": 127.0, "y": 63.5 }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !after.contains("nc-1"),
+            "the targeted no-connect is still on disk: {after}"
+        );
+        assert!(after.contains("nc-2"), "deleted the wrong block: {after}");
+        assert!(
+            konnect_sexp::parse_sexp(&after).is_ok(),
+            "file no longer parses: {after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_missing_no_connect_reports_an_error() {
+        let (_d, path) = schematic_with_two_no_connects();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let result = handle_delete_no_connect(
+            &json!({ "schematic": path.display().to_string(), "x": 999.0, "y": 999.0 }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "a miss must not report success");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "a failed delete must leave the file byte-identical"
+        );
+    }
+
+    /// The batch variant used to count `.is_ok()` on a handler that returns
+    /// `Ok(CallToolResult::error(..))` for a miss, so it reported a deletion
+    /// for every position whether or not anything was removed.
+    #[tokio::test]
+    async fn batch_delete_counts_only_what_it_removed() {
+        let (_d, path) = schematic_with_two_no_connects();
+        let result = handle_batch_delete_no_connect(
+            &json!({
+                "schematic": path.display().to_string(),
+                "positions": [ { "x": 127.0, "y": 63.5 }, { "x": 999.0, "y": 999.0 } ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["deleted"], 1, "only one position exists: {body}");
+        assert_eq!(
+            body["errors"].as_array().map(|e| e.len()),
+            Some(1),
+            "the missing position must be reported: {body}"
+        );
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(!after.contains("nc-1"));
+        assert!(after.contains("nc-2"));
     }
 }

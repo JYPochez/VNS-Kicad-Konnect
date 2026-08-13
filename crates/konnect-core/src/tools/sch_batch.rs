@@ -8,20 +8,29 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
-    find_symbol_instance_block, get_path, opt_str, require_f64, require_str, ToolDef,
+    find_symbol_instance_block, get_path, opt_str, project_name_for, require_f64, require_str,
+    ToolDef,
 };
+use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident, snap_point},
     schematic::{
         extract_labels, extract_lib_pins, extract_symbol_instances, extract_wires,
         format_net_label, format_wire, pin_endpoint, read_schematic,
     },
-    writer::{apply_edits, find_block_with_leading_whitespace, new_uuid, write_atomic, SexpEdit},
+    writer::{
+        apply_edits, find_block_with_leading_whitespace, find_enclosing_direct_child_block,
+        new_uuid, write_atomic, SexpEdit,
+    },
 };
 use serde_json::json;
+use std::collections::HashSet;
 
 // Re-use the crate-internal net-graph primitives from sch_analysis.
 use super::sch_analysis::build_net_graph;
+// Re-use the single-item component placer and pin-to-pin router.
+use super::sch_components::place_one_component;
+use super::sch_wiring::{resolve_pin_endpoint, route_between};
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -52,6 +61,59 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic", "net_name", "pins"]
             }),
             |args, ctx| async move { handle_batch_connect_to_net(args, ctx).await }
+        ),
+        tool!(
+            "batch_place_components",
+            "Place multiple symbols from KiCAD libraries in a single file read/write cycle. \
+             Pass explicit references -- there is no auto-numbering; an omitted reference \
+             becomes '?' like an eeschema-unannotated symbol, same as add_schematic_component.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "components": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "lib_id": { "type": "string" },
+                                "x": { "type": "number" }, "y": { "type": "number" },
+                                "rotation": { "type": "number", "default": 0 },
+                                "reference": { "type": "string" },
+                                "value": { "type": "string" },
+                                "unit": { "type": "integer", "default": 1 }
+                            },
+                            "required": ["lib_id", "x", "y"]
+                        }
+                    }
+                },
+                "required": ["schematic", "components"]
+            }),
+            |args, ctx| async move { handle_batch_place_components(args, ctx).await }
+        ),
+        tool!(
+            "batch_connect_pins",
+            "Connect multiple component pin pairs by reference and pin number, in a single \
+             file read/write cycle.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "connections": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "ref1": { "type": "string" }, "pin1": { "type": "string" },
+                                "ref2": { "type": "string" }, "pin2": { "type": "string" }
+                            },
+                            "required": ["ref1", "pin1", "ref2", "pin2"]
+                        }
+                    }
+                },
+                "required": ["schematic", "connections"]
+            }),
+            |args, ctx| async move { handle_batch_connect_pins(args, ctx).await }
         ),
         tool!(
             "batch_delete",
@@ -353,6 +415,135 @@ async fn handle_batch_connect_to_net(
     })))
 }
 
+/// Extract the message text out of a `CallToolResult` error, for folding a
+/// single-item handler's structured error into a batch tool's `errors` list.
+fn error_text(result: &CallToolResult) -> String {
+    match result.content.first() {
+        Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+        _ => "unknown error".to_string(),
+    }
+}
+
+async fn handle_batch_place_components(
+    args: &serde_json::Value,
+    _ctx: &crate::tools::ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let components = match args["components"].as_array() {
+        Some(a) => a.clone(),
+        None => return Ok(CallToolResult::error("Missing 'components' array")),
+    };
+
+    let mut sch = cse::Schematic::load(&sch_path)?;
+    let root_uuid = crate::tools::ensure_root_uuid(&mut sch);
+    let project_name = project_name_for(&sch_path);
+
+    let mut placed: Vec<serde_json::Value> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for comp in &components {
+        let Some(lib_id) = comp["lib_id"].as_str() else {
+            errors.push("Missing 'lib_id' in component spec".into());
+            continue;
+        };
+        let (Some(x), Some(y)) = (comp["x"].as_f64(), comp["y"].as_f64()) else {
+            errors.push(format!("Missing 'x'/'y' for '{}'", lib_id));
+            continue;
+        };
+        let rotation = comp["rotation"].as_f64().unwrap_or(0.0);
+        let reference = comp["reference"].as_str().unwrap_or("?");
+        let value = comp["value"].as_str();
+        let unit = comp["unit"].as_f64().unwrap_or(1.0) as u32;
+
+        match place_one_component(
+            &mut sch,
+            &root_uuid,
+            &project_name,
+            lib_id,
+            x,
+            y,
+            rotation,
+            reference,
+            value,
+            unit,
+        ) {
+            Ok(v) => placed.push(v),
+            Err(e) => errors.push(error_text(&e)),
+        }
+    }
+
+    if !placed.is_empty() {
+        sch.overwrite()?;
+    }
+
+    let mut result = CallToolResult::json(&json!({
+        "placed": placed,
+        "placed_count": placed.len(),
+        "errors": errors
+    }));
+    result.is_error = placed.is_empty() && !errors.is_empty();
+    Ok(result)
+}
+
+async fn handle_batch_connect_pins(
+    args: &serde_json::Value,
+    _ctx: &crate::tools::ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let connections = match args["connections"].as_array() {
+        Some(a) => a.clone(),
+        None => return Ok(CallToolResult::error("Missing 'connections' array")),
+    };
+
+    let (content, tree) = read_schematic(&sch_path)?;
+    let instances = extract_symbol_instances(&tree);
+    let lib_syms = tree
+        .find("lib_symbols")
+        .map(|n| n.find_all("symbol"))
+        .unwrap_or_default();
+
+    // Resolve every endpoint from the initial tree before any wire is
+    // inserted -- symbols/lib_symbols never change as wires are added, so
+    // this is safe to do up front instead of re-resolving per connection.
+    let mut resolved: Vec<(f64, f64, f64, f64)> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for conn in &connections {
+        let (Some(ref1), Some(pin1), Some(ref2), Some(pin2)) = (
+            conn["ref1"].as_str(),
+            conn["pin1"].as_str(),
+            conn["ref2"].as_str(),
+            conn["pin2"].as_str(),
+        ) else {
+            errors.push("Missing ref1/pin1/ref2/pin2 in connection spec".into());
+            continue;
+        };
+        match (
+            resolve_pin_endpoint(&instances, &lib_syms, ref1, pin1),
+            resolve_pin_endpoint(&instances, &lib_syms, ref2, pin2),
+        ) {
+            (Ok((x1, y1)), Ok((x2, y2))) => resolved.push((x1, y1, x2, y2)),
+            (Err(e), _) | (_, Err(e)) => errors.push(e.to_string()),
+        }
+    }
+
+    // ponytail: re-parses content per wire; incremental tree edits if batches get huge.
+    let mut new_content = content;
+    for (x1, y1, x2, y2) in &resolved {
+        new_content = route_between(new_content, *x1, *y1, *x2, *y2);
+    }
+
+    if !resolved.is_empty() {
+        write_atomic(&sch_path, &new_content)?;
+    }
+
+    let mut result = CallToolResult::json(&json!({
+        "connected_count": resolved.len(),
+        "errors": errors
+    }));
+    result.is_error = resolved.is_empty() && !errors.is_empty();
+    Ok(result)
+}
+
 async fn handle_batch_delete(
     args: &serde_json::Value,
     _ctx: &crate::tools::ToolContext,
@@ -363,6 +554,7 @@ async fn handle_batch_delete(
     let mut edits: Vec<SexpEdit> = Vec::new();
     let mut deleted: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
+    let mut delete_ranges: HashSet<(usize, usize)> = HashSet::new();
 
     // Delete by UUID — walk back from uuid node to enclosing top-level block
     if let Some(uuids) = args["uuids"].as_array() {
@@ -374,14 +566,23 @@ async fn handle_batch_delete(
             let pattern = format!(r#"(uuid "{}")"#, uuid);
             match content.find(&pattern) {
                 Some(uuid_pos) => {
-                    let before = &content[..uuid_pos];
-                    // Top-level schematic items are at 2-space indent: "\n  ("
-                    match before.rfind("\n  (").map(|p| p + 1) {
-                        Some(block_start) => {
+                    match find_enclosing_direct_child_block(&content, "kicad_sch", uuid_pos) {
+                        Some((block_start, block_end)) => {
+                            let item = &content[block_start..block_end];
+                            if !is_deletable_schematic_item(item) {
+                                errors.push(format!(
+                                    "UUID '{}' belongs to protected schematic structure '{}'",
+                                    uuid,
+                                    sexp_tag(item)
+                                ));
+                                continue;
+                            }
                             match find_block_with_leading_whitespace(&content, block_start) {
                                 Some((del_start, del_end)) => {
-                                    edits.push(SexpEdit::delete(del_start, del_end));
-                                    deleted.push(uuid.to_string());
+                                    if delete_ranges.insert((del_start, del_end)) {
+                                        edits.push(SexpEdit::delete(del_start, del_end));
+                                        deleted.push(uuid.to_string());
+                                    }
                                 }
                                 None => {
                                     errors.push(format!("Cannot parse block for UUID '{}'", uuid))
@@ -405,8 +606,10 @@ async fn handle_batch_delete(
             };
             match find_symbol_block(&content, reference) {
                 Some((del_start, del_end)) => {
-                    edits.push(SexpEdit::delete(del_start, del_end));
-                    deleted.push(reference.to_string());
+                    if delete_ranges.insert((del_start, del_end)) {
+                        edits.push(SexpEdit::delete(del_start, del_end));
+                        deleted.push(reference.to_string());
+                    }
                 }
                 None => errors.push(format!("Component '{}' not found", reference)),
             }
@@ -421,6 +624,35 @@ async fn handle_batch_delete(
         "deleted": deleted,
         "errors": errors
     })))
+}
+
+fn sexp_tag(block: &str) -> &str {
+    let Some(after_open) = block.strip_prefix('(') else {
+        return "";
+    };
+    let end = after_open
+        .find(|c: char| c.is_whitespace() || c == '(' || c == ')')
+        .unwrap_or(after_open.len());
+    &after_open[..end]
+}
+
+// Blocklist of structural forms, not an allowlist of item kinds: deleting a
+// drawing item (text, bus, sheet, image, polyline, …) by UUID has always
+// worked and must keep working — only the schematic's skeleton is protected.
+fn is_deletable_schematic_item(block: &str) -> bool {
+    !matches!(
+        sexp_tag(block),
+        "version"
+            | "generator"
+            | "generator_version"
+            | "uuid"
+            | "paper"
+            | "title_block"
+            | "lib_symbols"
+            | "sheet_instances"
+            | "symbol_instances"
+            | "embedded_fonts"
+    )
 }
 
 async fn handle_bulk_move(
@@ -913,8 +1145,11 @@ async fn handle_validate_component_connections(
         })
         .collect();
 
-    // Build net graph so we can check connectivity
-    let mut g = build_net_graph(&wires, &labels);
+    // Build net graph so we can check connectivity. Junctions matter: a pin
+    // sitting mid-wire is connected only through a junction dot, so without
+    // them this validator reports false "not connected" (#104).
+    let junction_pts = konnect_sexp::schematic::extract_junctions(&tree);
+    let mut g = build_net_graph(&wires, &labels, &junction_pts);
     // Also build flat wire-endpoint list for direct presence checks
     let all_wire_eps: Vec<(f64, f64)> = wires
         .iter()
@@ -927,6 +1162,18 @@ async fn handle_validate_component_connections(
         if all_wire_eps
             .iter()
             .any(|(wx, wy)| points_coincident(px, py, *wx, *wy, tol))
+        {
+            return true;
+        }
+        // A pin landing mid-wire connects only through a junction dot — KiCad's
+        // netlister registers the unsplit wire at a junction point, so a dot
+        // alone is enough and no wire split is required (#104).
+        if junction_pts
+            .iter()
+            .any(|(jx, jy)| points_coincident(px, py, *jx, *jy, tol))
+            && wires
+                .iter()
+                .any(|w| point_on_segment(px, py, w.x1, w.y1, w.x2, w.y2, tol))
         {
             return true;
         }
@@ -975,4 +1222,305 @@ async fn handle_validate_component_connections(
         "unconnected_count": unconnected.len(),
         "unconnected_pins": unconnected
     })))
+}
+
+#[cfg(test)]
+mod batch_delete_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, ToolContext};
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn batch_delete_uuid_is_tab_indentation_safe_and_deduplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("batch-delete.kicad_sch");
+        let uuid = "11111111-1111-1111-1111-111111111111";
+        std::fs::write(
+            &path,
+            format!(
+                "(kicad_sch\n\t(version 20260306)\n\t(generator \"eeschema\")\n\t(uuid \"root\")\n\t(wire\n\t\t(pts (xy 0 0) (xy 10 0))\n\t\t(uuid \"{uuid}\")\n\t)\n\t(text \"keep me\" (at 5 5 0) (uuid \"text\"))\n\t(sheet_instances (path \"/\" (page \"1\")))\n)\n"
+            ),
+        )
+        .unwrap();
+
+        let result = handle_batch_delete(
+            &json!({
+                "schematic": path.display().to_string(),
+                "uuids": [uuid, "root", uuid]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(!after.contains(uuid));
+        assert!(after.contains("(uuid \"root\")"));
+        assert!(after.contains("keep me"));
+        assert!(after.contains("(sheet_instances"));
+        assert!(konnect_sexp::parse_sexp(&after).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod batch_place_and_connect_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, ToolContext};
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    // Pre-seed lib_symbols so ensure_lib_symbol short-circuits without KiCad
+    // (precedent: sch_components.rs add_schematic_component_hides_power_reference).
+    const DEVICE_R: &str = "    (symbol \"Device:R\"\n      (property \"Reference\" \"R\" (at 0 0 0))\n      (property \"Value\" \"R\" (at 0 0 0))\n    )\n";
+
+    fn seeded_schematic() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("place.kicad_sch");
+        std::fs::write(
+            &path,
+            format!(
+                "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n{DEVICE_R}  )\n)\n"
+            ),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn batch_place_components_dedupes_lib_symbols() {
+        let (_d, path) = seeded_schematic();
+        let result = handle_batch_place_components(
+            &json!({
+                "schematic": path.display().to_string(),
+                "components": [
+                    { "lib_id": "Device:R", "x": 100.0, "y": 100.0, "reference": "R1" },
+                    { "lib_id": "Device:R", "x": 110.0, "y": 100.0, "reference": "R2" }
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        assert!(sch.symbols.by_reference("R1").is_some());
+        assert!(sch.symbols.by_reference("R2").is_some());
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after.matches("(symbol \"Device:R\"").count(),
+            1,
+            "lib_symbols entry must not be duplicated: {after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_place_components_collects_per_item_errors() {
+        let (_d, path) = seeded_schematic();
+        let result = handle_batch_place_components(
+            &json!({
+                "schematic": path.display().to_string(),
+                "components": [
+                    { "lib_id": "Device:R", "x": 100.0, "y": 100.0, "reference": "R1" },
+                    { "lib_id": "Nonexistent_xyzzy:Foo", "x": 110.0, "y": 100.0, "reference": "R2" },
+                    { "lib_id": "Device:R", "x": 120.0, "y": 100.0, "reference": "R3" }
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let body = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text"),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["placed_count"], 2);
+        assert_eq!(parsed["errors"].as_array().unwrap().len(), 1);
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        assert!(sch.symbols.by_reference("R1").is_some());
+        assert!(sch.symbols.by_reference("R3").is_some());
+        assert!(sch.symbols.by_reference("R2").is_none());
+    }
+
+    #[tokio::test]
+    async fn batch_place_components_total_failure_sets_is_error() {
+        let (_d, path) = seeded_schematic();
+        let result = handle_batch_place_components(
+            &json!({
+                "schematic": path.display().to_string(),
+                "components": [
+                    { "lib_id": "Nonexistent_xyzzy:Foo", "x": 100.0, "y": 100.0, "reference": "R1" }
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error, "{result:?}");
+    }
+
+    /// Six single-pin instances of a synthetic part, positioned so that
+    /// connecting them by pin pairs produces a T-junction on the second pair.
+    fn multi_point_schematic() -> (tempfile::TempDir, std::path::PathBuf) {
+        let pin_def = "\t\t\t(pin passive line (at 0 0 0) (length 0)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n";
+        let lib_sym = format!("\t\t(symbol \"Test:PT\"\n{pin_def}\t\t)\n");
+        let inst = |reference: &str, x: f64, y: f64, uuid: &str| {
+            format!(
+                "\t(symbol\n\t\t(lib_id \"Test:PT\")\n\t\t(at {x} {y} 0)\n\t\t(uuid \"{uuid}\")\n\t\t(property \"Reference\" \"{reference}\"\n\t\t\t(at {x} {y} 0)\n\t\t)\n\t)\n"
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("points.kicad_sch");
+        std::fs::write(
+            &path,
+            format!(
+                "(kicad_sch\n\t(version 20250610)\n\t(generator \"konnect\")\n\t(uuid \"3af69a4c-1faa-40bd-91dc-c4fc245c4cbd\")\n\t(lib_symbols\n{}\t)\n{}{}{}{}{}{})\n",
+                lib_sym,
+                inst("R1", 100.0, 100.0, "aaaaaaaa-0000-0000-0000-000000000001"),
+                inst("R2", 120.0, 100.0, "aaaaaaaa-0000-0000-0000-000000000002"),
+                inst("R3", 110.0, 80.0, "aaaaaaaa-0000-0000-0000-000000000003"),
+                inst("R4", 110.0, 100.0, "aaaaaaaa-0000-0000-0000-000000000004"),
+                inst("R5", 200.0, 100.0, "aaaaaaaa-0000-0000-0000-000000000005"),
+                inst("R6", 220.0, 100.0, "aaaaaaaa-0000-0000-0000-000000000006"),
+            ),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn batch_connect_pins_dedupes_junction_and_collects_errors() {
+        // R3-R4's wire T-lands on R1-R2's wire at (110, 100) -- without the
+        // STEP 1 fix, processing the third connection re-detects that same
+        // T-junction from the raw wire list and inserts a second dot.
+        let (_d, path) = multi_point_schematic();
+        let result = handle_batch_connect_pins(
+            &json!({
+                "schematic": path.display().to_string(),
+                "connections": [
+                    { "ref1": "R1", "pin1": "1", "ref2": "R2", "pin2": "1" },
+                    { "ref1": "R3", "pin1": "1", "ref2": "R4", "pin2": "1" },
+                    { "ref1": "R5", "pin1": "1", "ref2": "R6", "pin2": "1" },
+                    { "ref1": "Rbad", "pin1": "1", "ref2": "R6", "pin2": "1" }
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after.matches("(junction").count(),
+            1,
+            "the T-junction at (110, 100) must not be re-inserted: {after}"
+        );
+
+        let body = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            _ => panic!("expected text"),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["connected_count"], 3);
+        assert_eq!(parsed["errors"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod midwire_pin_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, ToolContext};
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// U1 has a single pin at (100,80), sitting strictly mid-segment on a wire
+    /// from (90,80) to (110,80).
+    fn midwire_schematic(with_junction: bool) -> (tempfile::TempDir, std::path::PathBuf) {
+        let junction = if with_junction {
+            "\t(junction (at 100 80) (diameter 0) (color 0 0 0 0) (uuid \"j1\"))\n"
+        } else {
+            ""
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("midwire.kicad_sch");
+        std::fs::write(
+            &path,
+            format!(
+                "(kicad_sch\n\t(version 20260306)\n\t(generator \"eeschema\")\n\t(uuid \"root\")\n\t(lib_symbols\n\t\t(symbol \"Test:P1\"\n\t\t\t(symbol \"P1_1_1\"\n\t\t\t\t(pin passive line (at 0 0 0) (length 2.54)\n\t\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t\t)\n\t\t\t)\n\t\t)\n\t)\n\t(wire\n\t\t(pts (xy 90 80) (xy 110 80))\n\t\t(uuid \"w1\")\n\t)\n{junction}\t(symbol\n\t\t(lib_id \"Test:P1\")\n\t\t(at 100 80 0)\n\t\t(unit 1)\n\t\t(uuid \"u1\")\n\t\t(property \"Reference\" \"U1\"\n\t\t\t(at 100 75 0)\n\t\t)\n\t)\n\t(sheet_instances (path \"/\" (page \"1\")))\n)\n"
+            ),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    /// KiCad connects a pin mid-wire only through a junction dot; the
+    /// validator must mirror that instead of demanding a wire endpoint.
+    #[tokio::test]
+    async fn midwire_pin_connects_with_junction_only() {
+        for (with_junction, expect_valid) in [(true, true), (false, false)] {
+            let (_d, path) = midwire_schematic(with_junction);
+            let result = handle_validate_component_connections(
+                &json!({ "schematic": path.display().to_string() }),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                panic!("expected text content");
+            };
+            let body: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(
+                body["valid"].as_bool(),
+                Some(expect_valid),
+                "with_junction={with_junction}: {body}"
+            );
+        }
+    }
 }
