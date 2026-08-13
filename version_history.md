@@ -13,7 +13,37 @@ The gate for each is upstream's own CI: `cargo test --workspace --lib --tests`,
 
 ## Unreleased — fixes on top of v0.2.2
 
-Test count: **407 → 439** (32 added). Clippy clean on upstream's CI invocation.
+Test count: **407 → 444** (37 added). Clippy clean on upstream's CI invocation.
+
+### `fix(sch)`: apply component-level edits to every unit of a multi-unit symbol
+
+**Problem — three tools quietly operated on unit 1 only.** `find_symbol_instance_block`
+returns the *first* `(symbol …)` block matching a reference. That is correct when the caller
+means one placement, but a multi-unit part is one block **per unit**, all repeating the
+reference, and three handlers were using it for operations that concern the whole component:
+
+- `batch_edit_schematic_components` — wrote `Value`/`Footprint`/custom fields into unit 1 and
+  left units 2..n untouched. Assigning a footprint to a 74HC14 produced one part claiming a
+  footprint in one unit and none in the other six; eeschema keeps these copies identical, so
+  the file was internally inconsistent. Caught in real use: `U6` reported
+  `Footprint → Package_SO:SOIC-14…` and only 1 of 7 units had it.
+- `batch_delete_schematic_components` and `batch_delete` — deleted unit 1's block and left the
+  rest behind as orphans referencing a component the caller believes is gone.
+- `bulk_move_schematic_components` — shifted unit 1 and left the other units where they were,
+  tearing the part apart.
+
+**Fix.** New `find_all_symbol_instance_blocks` returns every instance in file order;
+`find_symbol_instance_block` now delegates to it and takes the first, so single-placement
+callers are unchanged. `field_value_range` → `field_value_ranges` and `find_symbol_block` →
+`find_symbol_blocks` return one entry per unit, and the three handlers apply their edit to all
+of them. `batch_edit` reports `Footprint → … (7 units)` so the fan-out is visible in the
+result rather than implied.
+
+**Tests.** Five, on a 3-unit part sitting next to an unrelated single-unit part: a field edit
+rewrites all three copies and leaves the neighbour alone; a single-unit part still edits once;
+a missing field and an unknown reference both yield no ranges; deletion removes every unit
+while sparing the `lib_symbols` definition; and the per-unit blocks are disjoint and ordered,
+which is what `apply_edits` requires to splice correctly.
 
 ### `fix(sch)`: resolve pins against the owning unit of a multi-unit symbol
 
