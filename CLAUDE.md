@@ -75,6 +75,8 @@ Exposing all 185 tools costs ~25K tokens per listing, so the router only pre-loa
 
 ## Conventions
 
+**Every commit updates `version_history.md`** — add an entry for the change under "Unreleased" with the problem, the fix and the tests, in the same commit as the code. The file is the fork's changelog and the source for `README-FORK.md`; a commit that changes behaviour without an entry there is incomplete.
+
 **Adding a tool** — add a `tool!(name, desc, schema, handler)` entry to the toolset's `tools()` vec, write the `async fn handle_*` below it, bump `tool_count` in `router/registry.rs`, then regenerate the matching section of `tool-directory.md` (extraction procedure is in that file's header). The registry invariant tests in `router/mod.rs` catch a stale `tool_count`, duplicate tool names within and across toolsets, and any toolset exceeding 20 tools — but nothing checks `tool-directory.md`, so keep that in sync by hand.
 
 **Errors** — failures are typed via `ToolErrorKind` in `mcp/error.rs` and serialized *inside* the text content (MCP's `CallToolResult` has no `data` field). Prefer `CallToolResult::error_kind(...)` over free-text `CallToolResult::error(...)`; migration from `anyhow` is incremental, so both exist. Adding a kind means editing the enum *and* `short_code()` — the `short_code_matches_serialized_kind_field` test fails if they drift.

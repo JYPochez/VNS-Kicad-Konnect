@@ -13,7 +13,53 @@ The gate for each is upstream's own CI: `cargo test --workspace --lib --tests`,
 
 ## Unreleased — fixes on top of v0.2.2
 
-Test count: **407 → 422** (15 added). Clippy clean on upstream's CI invocation.
+Test count: **407 → 430** (23 added). Clippy clean on upstream's CI invocation.
+
+### `fix(sch-editor)`: resolve symbol libraries through sym-lib-table
+
+**Problem.** `resolve_lib_symbol` never read `sym-lib-table`. It scanned a hardcoded list of
+install directories for a file *named after the library nickname*. Two consequences, both
+total rather than partial:
+
+- **Every user library was invisible.** A library registered in the table but living anywhere
+  else on disk could not be resolved, so `add_schematic_component` and `replace_component`
+  failed for any part not shipped with KiCad.
+- **KiCad's own libraries were invisible on any non-standard install.** The macOS candidates
+  are `/Applications/KiCad/…`, `/usr/local/share/kicad/…` and `~/Applications/…`. A bundle
+  living anywhere else — this machine keeps it under `~/ CAO/ Elec/Kicad 10/` — makes
+  `find_symbol_dirs()` return **empty**, and *no symbol at all* resolves.
+
+The scan also assumed nickname == filename, which KiCad never requires: a table may register
+`…/TM16xx.kicad_sym` under the nickname `JY-TM16xx`.
+
+Footprints already resolved through the lib-table (v0.2.1, #61). Symbols never got the same
+treatment.
+
+**Fix.** `sym-lib-table` is consulted first — it is what KiCad itself uses — with the
+directory scan kept as a fallback for setups with no table. Adds a small table reader to
+`konnect-schematic-editor`:
+
+- follows `(type "Table")` indirection, depth-bounded so a self-referencing table terminates;
+- expands `${KIPRJMOD}` against the table's own directory, since KiCad sets it per open
+  project and an exported value could name a different one;
+- expands exported environment variables;
+- expands **user path variables from `kicad_common.json`** — the ones set in Preferences →
+  Configure Paths. These are not process environment variables, so `std::env::var` never sees
+  them, yet they are the normal way to write a portable table (`${MY_LIB}/parts.kicad_sym`);
+- falls back for `${KICAD*_SYMBOL_DIR}` to the install root recovered from the table's own
+  location, which is how a bundled table is found when the variable is unset.
+
+Also extracts the library-prefixing logic that was duplicated inline into
+`prefix_symbol_block`.
+
+**Tests.** Eight: plain URIs, `${KIPRJMOD}` with and without an anchor, exported env vars,
+unknown variables failing rather than silently dropping the prefix, a nickname that differs
+from its filename, nested table indirection, a self-referencing table terminating, and the
+field parser.
+
+**Verified live** on this machine: `JY-TM16xx:TM1637`, `JY-KYX3561AS:3661BW`,
+`MCU_WCH_RiscV:CH32V003FxPx`, `Device:R`, `power:GND` and others all resolve, where
+previously **none** did.
 
 ### `146bb5b` — fix(mcp): contain a panicking tool handler instead of killing the server
 
