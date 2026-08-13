@@ -186,37 +186,97 @@ pub(crate) fn pt_key(x: f64, y: f64) -> (i64, i64) {
 pub(crate) struct NetGraph {
     pub(crate) point_nets: HashMap<(i64, i64), String>,
     pub(crate) parent: HashMap<(i64, i64), (i64, i64)>,
+    /// Component size, meaningful only for roots. Used for union-by-size so
+    /// that parent chains stay shallow — see `union`.
+    size: HashMap<(i64, i64), usize>,
+    /// Every wire segment fed in via `add_wire`, kept so that a *query* point
+    /// can be attached to the segment it lies on. Build-time attachment only
+    /// covers labels and junctions; a pin sitting on a wire's interior, or an
+    /// arbitrary `trace_from_point` coordinate, is not known until asked for.
+    segments: Vec<(f64, f64, f64, f64)>,
 }
+
+/// Tolerance for deciding a point lies on a segment, in mm. KiCad snaps
+/// schematic geometry to a 1.27 mm grid, so 0.01 mm is far below anything
+/// meaningful while still absorbing float error from pin transforms.
+const ON_SEGMENT_TOL: f64 = 0.01;
 
 impl NetGraph {
     pub(crate) fn new() -> Self {
         NetGraph {
             point_nets: HashMap::new(),
             parent: HashMap::new(),
+            size: HashMap::new(),
+            segments: Vec::new(),
+        }
+    }
+
+    /// Union `(x, y)` with every wire segment that passes through it.
+    ///
+    /// This is what makes a point on a wire's *interior* part of that wire's
+    /// net. It is applied both when building the graph (labels, junctions)
+    /// and when querying it (pins, trace points).
+    pub(crate) fn attach_to_segments(&mut self, x: f64, y: f64) {
+        let anchors: Vec<(f64, f64)> = self
+            .segments
+            .iter()
+            .filter(|(x1, y1, x2, y2)| point_on_segment(x, y, *x1, *y1, *x2, *y2, ON_SEGMENT_TOL))
+            .map(|(x1, y1, _, _)| (*x1, *y1))
+            .collect();
+        for (ax, ay) in anchors {
+            self.union(pt_key(x, y), pt_key(ax, ay));
         }
     }
 
     pub(crate) fn ensure(&mut self, k: (i64, i64)) {
-        self.parent.entry(k).or_insert(k);
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.parent.entry(k) {
+            slot.insert(k);
+            self.size.insert(k, 1);
+        }
     }
 
+    /// Resolve `k` to its component root, compressing the path on the way.
+    ///
+    /// Deliberately iterative. A recursive version overflows the stack on a
+    /// long parent chain, and a Rust stack overflow aborts the process — it
+    /// is not a catchable panic, so no dispatch-level guard can contain it.
     pub(crate) fn find(&mut self, k: (i64, i64)) -> (i64, i64) {
         self.ensure(k);
-        let p = self.parent[&k];
-        if p == k {
-            return k;
+
+        // Pass 1: walk to the root.
+        let mut root = k;
+        while let Some(&p) = self.parent.get(&root) {
+            if p == root {
+                break;
+            }
+            root = p;
         }
-        let root = self.find(p);
-        self.parent.insert(k, root);
+
+        // Pass 2: re-walk the same chain, pointing every node at the root.
+        let mut cur = k;
+        while cur != root {
+            let next = self.parent[&cur];
+            self.parent.insert(cur, root);
+            cur = next;
+        }
+
         root
     }
 
     pub(crate) fn union(&mut self, a: (i64, i64), b: (i64, i64)) {
         let ra = self.find(a);
         let rb = self.find(b);
-        if ra != rb {
-            self.parent.insert(rb, ra);
+        if ra == rb {
+            return;
         }
+        // Attach the smaller component under the larger. Without this, a
+        // degenerate insertion order builds one long chain and every later
+        // `find` walks its full length.
+        let sa = self.size.get(&ra).copied().unwrap_or(1);
+        let sb = self.size.get(&rb).copied().unwrap_or(1);
+        let (big, small) = if sa >= sb { (ra, rb) } else { (rb, ra) };
+        self.parent.insert(small, big);
+        self.size.insert(big, sa + sb);
     }
 
     pub(crate) fn add_wire(&mut self, w: &Wire) {
@@ -225,6 +285,7 @@ impl NetGraph {
         self.ensure(a);
         self.ensure(b);
         self.union(a, b);
+        self.segments.push((w.x1, w.y1, w.x2, w.y2));
     }
 
     pub(crate) fn add_label(&mut self, x: f64, y: f64, net: &str) {
@@ -233,17 +294,55 @@ impl NetGraph {
         self.point_nets.insert(k, net.to_string());
     }
 
-    pub(crate) fn net_at(&mut self, x: f64, y: f64) -> Option<String> {
+    /// Every distinct net name electrically reachable from `(x, y)`, sorted.
+    ///
+    /// More than one name means the net carries conflicting labels — a real
+    /// design error worth reporting rather than silently resolving.
+    pub(crate) fn nets_at(&mut self, x: f64, y: f64) -> Vec<String> {
         let k = pt_key(x, y);
         self.ensure(k);
+        // The query point may sit on a wire's interior rather than at one of
+        // its endpoints — a pin landing mid-wire, or an arbitrary traced
+        // coordinate. Without this it resolves to an isolated component and
+        // the caller is told the point is unconnected.
+        self.attach_to_segments(x, y);
         let root = self.find(k);
-        let labels: Vec<_> = self.point_nets.clone().into_iter().collect();
-        for (lk, net) in labels {
+
+        // Collect the keys first — they are `Copy`, so this is cheap — rather
+        // than cloning the whole `point_nets` map on every call. `find` needs
+        // `&mut self`, which is why the borrow cannot be held across the loop.
+        // Same technique as `points_on_net` below.
+        let keys: Vec<(i64, i64)> = self.point_nets.keys().copied().collect();
+
+        // Resolve roots first (needs `&mut self`), then read the names (needs
+        // `&self`). Fusing the two passes into one iterator chain would hold
+        // both borrows at once.
+        let mut matching: Vec<(i64, i64)> = Vec::new();
+        for lk in keys {
             if self.find(lk) == root {
-                return Some(net);
+                matching.push(lk);
             }
         }
-        None
+
+        let mut names: Vec<String> = matching
+            .into_iter()
+            .filter_map(|lk| self.point_nets.get(&lk).cloned())
+            .collect();
+
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// The net at `(x, y)`, or `None` if the point reaches no label.
+    ///
+    /// When a net carries several labels this returns the first in sort order.
+    /// The choice is arbitrary but **stable**: iterating `point_nets` directly
+    /// returned whichever key the hasher happened to yield first, so the same
+    /// schematic could report different nets on different runs. Callers that
+    /// need to see a conflict should use [`NetGraph::nets_at`].
+    pub(crate) fn net_at(&mut self, x: f64, y: f64) -> Option<String> {
+        self.nets_at(x, y).into_iter().next()
     }
 
     pub(crate) fn points_on_net(&mut self, net: &str) -> Vec<(i64, i64)> {
@@ -274,21 +373,14 @@ pub(crate) fn build_net_graph(
     }
     // Labels and junction dots connect anywhere along a wire, not only at
     // endpoints — union each such point with the segment it sits on.
-    // ponytail: O(P×W) scan; fine at schematic scale, index wires if it hurts.
-    let attach = |g: &mut NetGraph, x: f64, y: f64| {
-        for w in wires {
-            if point_on_segment(x, y, w.x1, w.y1, w.x2, w.y2, 0.01) {
-                g.union(pt_key(x, y), pt_key(w.x1, w.y1));
-            }
-        }
-    };
+    // O(P×W) scan; fine at schematic scale, index wires if it ever hurts.
     for l in labels {
         g.add_label(l.x, l.y, &l.net);
-        attach(&mut g, l.x, l.y);
+        g.attach_to_segments(l.x, l.y);
     }
     for &(jx, jy) in junctions {
         g.ensure(pt_key(jx, jy));
-        attach(&mut g, jx, jy);
+        g.attach_to_segments(jx, jy);
     }
     g
 }
@@ -835,4 +927,166 @@ async fn handle_check_overlaps(
     Ok(CallToolResult::json(
         &json!({ "overlap_count": all.len(), "overlaps": all }),
     ))
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod net_graph_tests {
+    use super::*;
+    use konnect_sexp::schematic::{Label, LabelKind};
+
+    fn wire(x1: f64, y1: f64, x2: f64, y2: f64) -> Wire {
+        Wire {
+            x1,
+            y1,
+            x2,
+            y2,
+            uuid: None,
+        }
+    }
+
+    fn label(net: &str, x: f64, y: f64) -> Label {
+        Label {
+            kind: LabelKind::NetLabel,
+            net: net.to_string(),
+            x,
+            y,
+            rotation: 0.0,
+            uuid: None,
+        }
+    }
+
+    /// Two wires meeting end-to-end are one net.
+    #[test]
+    fn wires_sharing_an_endpoint_are_one_net() {
+        let wires = vec![wire(0.0, 0.0, 10.0, 0.0), wire(10.0, 0.0, 10.0, 10.0)];
+        let labels = vec![label("VCC", 0.0, 0.0)];
+        let mut g = build_net_graph(&wires, &labels, &[]);
+        assert_eq!(g.net_at(10.0, 10.0).as_deref(), Some("VCC"));
+    }
+
+    /// Disjoint wires must NOT be merged — the guard against over-connecting.
+    #[test]
+    fn disjoint_wires_stay_separate() {
+        let wires = vec![wire(0.0, 0.0, 10.0, 0.0), wire(0.0, 50.0, 10.0, 50.0)];
+        let labels = vec![label("VCC", 0.0, 0.0)];
+        let mut g = build_net_graph(&wires, &labels, &[]);
+        assert_eq!(g.net_at(10.0, 0.0).as_deref(), Some("VCC"));
+        assert_eq!(g.net_at(10.0, 50.0), None, "separate wires must not merge");
+    }
+
+    /// A junction dot at a T joins the crossing wire to the through wire.
+    #[test]
+    fn junction_dot_connects_a_t_junction() {
+        let wires = vec![wire(0.0, 0.0, 10.0, 0.0), wire(5.0, 0.0, 5.0, 10.0)];
+        let labels = vec![label("GND", 0.0, 0.0)];
+
+        let mut without = build_net_graph(&wires, &labels, &[]);
+        let mut with = build_net_graph(&wires, &labels, &[(5.0, 0.0)]);
+
+        assert_eq!(
+            with.net_at(5.0, 10.0).as_deref(),
+            Some("GND"),
+            "a junction dot must tie the branch to the through wire"
+        );
+        // Document the un-dotted behaviour so a future change is deliberate.
+        assert_eq!(without.net_at(5.0, 10.0), None);
+    }
+
+    /// A label sitting mid-segment names the whole wire, not just its point.
+    /// Upstream measured 64% of labels in KiCad's demo corpus sit this way.
+    #[test]
+    fn mid_segment_label_names_the_whole_wire() {
+        let wires = vec![wire(0.0, 0.0, 10.0, 0.0)];
+        let labels = vec![label("SDA", 5.0, 0.0)];
+        let mut g = build_net_graph(&wires, &labels, &[]);
+        assert_eq!(g.net_at(0.0, 0.0).as_deref(), Some("SDA"));
+        assert_eq!(g.net_at(10.0, 0.0).as_deref(), Some("SDA"));
+    }
+
+    /// The regression this module exists for: a net carrying two labels used to
+    /// return whichever the hasher yielded first, so the same file could report
+    /// a different net between runs. Rebuild repeatedly and require agreement.
+    #[test]
+    fn net_at_is_deterministic_when_a_net_has_several_labels() {
+        let wires = vec![wire(0.0, 0.0, 10.0, 0.0)];
+        let labels = vec![
+            label("VCC", 0.0, 0.0),
+            label("+3V3", 10.0, 0.0),
+            label("VDD", 5.0, 0.0),
+        ];
+
+        let first = build_net_graph(&wires, &labels, &[]).net_at(0.0, 0.0);
+        assert!(first.is_some());
+        for _ in 0..50 {
+            let mut g = build_net_graph(&wires, &labels, &[]);
+            assert_eq!(
+                g.net_at(0.0, 0.0),
+                first,
+                "net_at must not vary between runs"
+            );
+        }
+    }
+
+    /// Conflicting labels are reported rather than silently resolved.
+    #[test]
+    fn nets_at_reports_every_conflicting_label() {
+        let wires = vec![wire(0.0, 0.0, 10.0, 0.0)];
+        let labels = vec![label("VCC", 0.0, 0.0), label("+3V3", 10.0, 0.0)];
+        let mut g = build_net_graph(&wires, &labels, &[]);
+        assert_eq!(
+            g.nets_at(5.0, 0.0),
+            vec!["+3V3".to_string(), "VCC".to_string()]
+        );
+    }
+
+    /// A pin landing on a wire's interior is connected, with or without a
+    /// junction dot. Build-time attachment only covers labels and junctions,
+    /// so the query point has to be attached when it is asked about.
+    #[test]
+    fn pin_on_wire_interior_is_connected() {
+        let wires = vec![wire(0.0, 0.0, 25.4, 0.0)];
+        let labels = vec![label("SCL", 0.0, 0.0)];
+        let mut g = build_net_graph(&wires, &labels, &[]);
+        // A pin sitting at 12.7 mm — mid-segment, not an endpoint, no junction.
+        assert_eq!(g.net_at(12.7, 0.0).as_deref(), Some("SCL"));
+    }
+
+    /// Repeated queries must not corrupt the graph: attaching a query point
+    /// mutates the union-find, so the second answer must match the first.
+    #[test]
+    fn repeated_queries_are_stable() {
+        let wires = vec![wire(0.0, 0.0, 25.4, 0.0)];
+        let labels = vec![label("SCL", 0.0, 0.0)];
+        let mut g = build_net_graph(&wires, &labels, &[]);
+        let a = g.net_at(12.7, 0.0);
+        let b = g.net_at(12.7, 0.0);
+        let c = g.net_at(0.0, 0.0);
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        assert_eq!(a.as_deref(), Some("SCL"));
+    }
+
+    /// A point touching nothing has no net, and must not invent one.
+    #[test]
+    fn isolated_point_has_no_net() {
+        let wires = vec![wire(0.0, 0.0, 10.0, 0.0)];
+        let labels = vec![label("VCC", 0.0, 0.0)];
+        let mut g = build_net_graph(&wires, &labels, &[]);
+        assert_eq!(g.net_at(99.0, 99.0), None);
+    }
+
+    /// Union-find must survive a long chain. Recursive `find` overflowed the
+    /// stack here, which aborts the process rather than raising a catchable
+    /// panic. 50k segments laid end to end is the degenerate ordering.
+    #[test]
+    fn long_wire_chain_does_not_overflow_the_stack() {
+        let wires: Vec<Wire> = (0..50_000)
+            .map(|i| wire(i as f64, 0.0, (i + 1) as f64, 0.0))
+            .collect();
+        let labels = vec![label("LONG", 0.0, 0.0)];
+        let mut g = build_net_graph(&wires, &labels, &[]);
+        assert_eq!(g.net_at(50_000.0, 0.0).as_deref(), Some("LONG"));
+    }
 }
