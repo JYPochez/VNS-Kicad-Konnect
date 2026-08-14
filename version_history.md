@@ -13,7 +13,28 @@ The gate for each is upstream's own CI: `cargo test --workspace --lib --tests`,
 
 ## Unreleased — fixes on top of v0.2.2
 
-Test count: **407 → 450** (43 added). Clippy clean on upstream's CI invocation.
+Test count: **407 → 455** (48 added). Clippy clean on upstream's CI invocation.
+
+### `feat(sch)`: add `set_schematic_page`
+
+**Problem.** Nothing in Konnect could set the sheet size. `create_schematic` produces a blank
+sheet with no `(paper …)` node at all, and there was no way to change one — so a design that
+outgrew A4 either stayed on A4 with content hanging off the frame, or forced a hand edit of
+the `.kicad_sch`, which is exactly what the tooling exists to avoid.
+
+Content outside the frame still exports and still nets up, so an undersized page is a *silent*
+defect: ERC says nothing. The tool therefore returns the chosen size's width and height in mm,
+so a caller can check them against the layout's extents.
+
+**What it adds.** `set_schematic_page(schematic, size, portrait?)` for A0–A5, A–E, US Letter /
+Legal / Ledger. Replaces an existing `(paper …)` node or, when there is none, inserts one in
+the header ahead of any element. An unrecognised size is a structured `InvalidArgument` and
+leaves the file untouched.
+
+**Tests.** Five: replace an existing node without leaving the old size behind; insert into a
+blank sheet and land before the first element; mark portrait on the node; reject an unknown
+size without writing; and a table invariant that every listed size is stored landscape
+(`w > h`), since the portrait flag swaps them.
 
 ### `feat(sch)`: add the `sch_bus` toolset — buses, bus entries, pin fan-out
 
