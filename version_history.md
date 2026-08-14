@@ -13,7 +13,21 @@ The gate for each is upstream's own CI: `cargo test --workspace --lib --tests`,
 
 ## Unreleased — fixes on top of v0.2.2
 
-Test count: **407 → 455** (48 added). Clippy clean on upstream's CI invocation.
+Test count: **407 → 458** (51 added). Clippy clean on upstream's CI invocation.
+
+### `feat(sch)`: add `batch_add_no_connect`
+
+**Problem.** `batch_delete_no_connect` existed but there was no batch *add* — an odd asymmetry
+that only shows up when it bites. Marking the unused pins of a single MCU is routinely 15-20
+flags, and every one was a separate `add_no_connect` round trip. Flagging this design's unused
+CH32V203, programmer and USB pins took 23.
+
+**Fix.** `batch_add_no_connect(schematic, positions[])`, mirroring the delete tool. A malformed
+entry is reported and skipped rather than aborting the batch, so the failure mode when placing
+twenty flags is "nineteen landed and one is named".
+
+**Tests.** Three: every flag lands in one pass; one bad entry does not cost the good ones; an
+empty list is a no-op.
 
 ### `feat(sch)`: add `set_schematic_page`
 
