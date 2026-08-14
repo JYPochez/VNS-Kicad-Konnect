@@ -13,7 +13,7 @@
 Rust binary — that lets Claude and other AI assistants design schematics and PCBs
 through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
-**187 tools across 18 on-demand toolsets.** Schematic capture, PCB layout and
+**193 tools across 19 on-demand toolsets.** Schematic capture, PCB layout and
 routing, ERC/DRC, design-review audits, JLCPCB part search, Freerouting, reference
 circuits, and a full manufacturing export pipeline — with bundled skills and agents
 that teach Claude KiCAD conventions out of the box.
@@ -47,9 +47,30 @@ that teach Claude KiCAD conventions out of the box.
 >   panic unwound out of `main` and took every other loaded tool with it.
 > - **String escapes decode correctly.** Chained `replace` calls collapsed backslashes last,
 >   so a serialized `C:\\new` came back as `C:\` followed by a real newline.
+> - **Multi-unit symbols are handled as one component.** A multi-unit part is placed as one
+>   instance *per unit*, all sharing the reference, and four tools took the **first** match:
+>   `batch_connect_to_net` transformed every pin by unit 1's placement — silently landing two
+>   nets on one coordinate and shorting them, with no error; `batch_edit_schematic_components`
+>   wrote fields into unit 1 only; the delete tools left the other units behind as orphans;
+>   `bulk_move` tore the part apart. Pin lookups now resolve against the unit that owns the
+>   pin, and component-level edits apply to every unit.
+> - **`add_schematic_text` no longer writes an unopenable file.** It spliced the node in after
+>   the symbol instances (KiCad 10 requires those last) and wrote literal newlines where the
+>   format wants `\n`. Either one makes the whole schematic fail to load, while the tool
+>   reports success.
 >
 > **Added tools**
 >
+> - **`sch_bus` toolset** — `add_bus`, `batch_add_bus`, `add_bus_entry`, and
+>   `connect_pins_to_bus`. `SchematicBuilder` already round-tripped bus nodes, but nothing
+>   could create one, so any repeated multi-signal link had to be one wire per signal or bare
+>   labels. `connect_pins_to_bus` writes the stub, the entry *and* the member label per pin,
+>   because bus membership in KiCad is by name — a stub without a label joins nothing.
+> - `set_schematic_page` — sets the sheet size. Content outside the frame still exports and
+>   still nets up, so an undersized page is a silent defect; the tool returns the size in mm
+>   so the caller can check it against the layout.
+> - `batch_add_no_connect` — `batch_delete_no_connect` existed with no batch add; marking one
+>   MCU's unused pins is routinely 15–20 round trips.
 > - `update_symbols_from_library` — eeschema's *Update Symbols from Library*. Refuses any
 >   symbol whose pins moved, since wires and labels sit at the old coordinates.
 > - `rename_project` — renames the project files *and* the internal references. Renaming
@@ -58,7 +79,7 @@ that teach Claude KiCAD conventions out of the box.
 > - `reload_server` — `exec`s into the rebuilt binary in place, keeping the PID and stdio
 >   pipes so the MCP client's connection survives. Verifies the new binary first.
 >
-> 437 tests (30 added); `cargo clippy --workspace -- -D warnings` clean.
+> 458 tests (51 added); `cargo clippy --workspace -- -D warnings` clean.
 
 > **Status: beta.** The core toolchain is tested and working, but this is a young
 > release and it wants real-world mileage and review. Issues and PRs are welcome —
