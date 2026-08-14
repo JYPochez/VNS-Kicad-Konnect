@@ -2207,7 +2207,6 @@ mod update_symbols_tests {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod page_tests {
     use super::{tools, PAPER_SIZES};
     use crate::tools::ToolContext;
