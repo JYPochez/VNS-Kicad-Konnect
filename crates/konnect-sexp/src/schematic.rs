@@ -427,6 +427,29 @@ pub fn format_wire(x1: f64, y1: f64, x2: f64, y2: f64) -> String {
     )
 }
 
+/// A bus segment. Same geometry as a wire; KiCad tells the two apart by the
+/// node name and by the label attached to them, not by anything in the points.
+pub fn format_bus(x1: f64, y1: f64, x2: f64, y2: f64) -> String {
+    let uuid = crate::writer::new_uuid();
+    format!(
+        "(bus\n\t\t(pts\n\t\t\t(xy {} {}) (xy {} {})\n\t\t)\n\t\t(stroke\n\t\t\t(width 0)\n\t\t\t(type default)\n\t\t)\n\t\t(uuid \"{}\")\n\t)",
+        x1, y1, x2, y2, uuid
+    )
+}
+
+/// The short diagonal stub that ties a wire to a bus.
+///
+/// `(at)` is the end that touches the *wire*; `(size)` is the signed offset to
+/// the end that touches the bus, so the two ends are `(x, y)` and
+/// `(x + dx, y + dy)`. KiCad draws it as a 45° tick, which is why both
+/// components are conventionally ±2.54.
+pub fn format_bus_entry(x: f64, y: f64, dx: f64, dy: f64) -> String {
+    let uuid = crate::writer::new_uuid();
+    format!(
+        "(bus_entry\n\t\t(at {x} {y})\n\t\t(size {dx} {dy})\n\t\t(stroke\n\t\t\t(width 0)\n\t\t\t(type default)\n\t\t)\n\t\t(uuid \"{uuid}\")\n\t)"
+    )
+}
+
 pub fn format_junction(x: f64, y: f64) -> String {
     let uuid = crate::writer::new_uuid();
     format!(

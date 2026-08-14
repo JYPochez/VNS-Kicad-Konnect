@@ -13,7 +13,34 @@ The gate for each is upstream's own CI: `cargo test --workspace --lib --tests`,
 
 ## Unreleased — fixes on top of v0.2.2
 
-Test count: **407 → 447** (40 added). Clippy clean on upstream's CI invocation.
+Test count: **407 → 450** (43 added). Clippy clean on upstream's CI invocation.
+
+### `feat(sch)`: add the `sch_bus` toolset — buses, bus entries, pin fan-out
+
+**Problem.** Konnect could not draw a bus. `SchematicBuilder` already round-tripped `bus` and
+`bus_entry` nodes and knew their slot in KiCad's required element order, so a bus drawn in
+eeschema survived a Konnect edit — but nothing could *create* one. Any repeated multi-signal
+link (a driver to its display, a memory bus) had to be drawn either as one wire per signal or
+left as bare net labels.
+
+**Why it needs its own toolset.** `sch_wiring` is at 19 tools and the registry invariant caps a
+toolset at 20, so bus support gets a fifth schematic toolset rather than crowding that limit.
+
+**What it adds.**
+
+- `add_bus` / `batch_add_bus` — bus segments. Geometrically identical to wires; KiCad tells
+  them apart by the node name and the attached label.
+- `add_bus_entry` — the 45° tick bridging a wire and a bus. Not decoration: a wire and a bus
+  that merely touch are **not** connected without one.
+- `connect_pins_to_bus` — the useful one. For each pin it writes the wire stub, the bus entry,
+  *and* the member net label, because bus membership in KiCad is by **name**, not geometry: a
+  stub with no label joins nothing. Resolving each pin goes through the owning unit, so it is
+  correct for multi-unit parts.
+
+**Verified against KiCad**, not just unit-tested: two 4-pin connectors fanned onto one bus
+export a netlist with `D0`…`D3` each carrying exactly its two pins, and ERC reports 0
+violations. Unit tests cover the node name, the signed `size` offset on an entry (getting the
+sign wrong puts the tick on the far side of the bus, connecting nothing), and registration.
 
 ### `fix(sch)`: `add_schematic_text` wrote schematics KiCad could not open
 
