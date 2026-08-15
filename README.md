@@ -18,6 +18,81 @@ routing, ERC/DRC, design-review audits, JLCPCB part search, Freerouting, referen
 circuits, and a full manufacturing export pipeline — with bundled skills and agents
 that teach Claude KiCAD conventions out of the box.
 
+> ### This is a fork
+>
+> [JYPochez/VNS-Kicad-Konnect](https://github.com/JYPochez/VNS-Kicad-Konnect) — a fork of
+> [mixelpixx/Konnect](https://github.com/mixelpixx/Konnect) v0.2.2, carrying correctness
+> fixes and a few tools found missing while using it on real hardware. Everything here is
+> offered back upstream; the fork is not a divergence.
+>
+> **Fixes**
+>
+> - **Symbol libraries resolve through `sym-lib-table`.** `resolve_lib_symbol` scanned a
+>   hardcoded list of install directories for a file named after the library nickname, so
+>   every user library was invisible — and on any non-standard KiCad install (a macOS bundle
+>   outside `/Applications`, say) *no symbol resolved at all*. Footprints got table-aware
+>   resolution in v0.2.1; symbols never did. Now the table is read first, following
+>   `(type "Table")` indirection and expanding `${KIPRJMOD}`, environment variables and the
+>   user path variables set in Preferences → Configure Paths.
+> - **Net queries are deterministic.** `net_at` returned the first label reached while
+>   iterating a `HashMap`, so a net carrying two labels resolved differently between runs.
+>   Results are now sorted and stable, and `nets_at` exposes the whole set so a conflicting
+>   label becomes a reportable error instead of a coin-flip.
+> - **Mid-wire query points connect.** A pin landing on a wire's interior, or any
+>   `trace_from_point` coordinate, resolved to an isolated component and read as
+>   unconnected.
+> - **Union-find no longer overflows the stack.** Path compression recursed; a long parent
+>   chain aborted the process, which no handler can catch. Now iterative, with union-by-size.
+> - **A panicking tool no longer kills the server.** Handlers were awaited inline, so one
+>   panic unwound out of `main` and took every other loaded tool with it.
+> - **String escapes decode correctly.** Chained `replace` calls collapsed backslashes last,
+>   so a serialized `C:\\new` came back as `C:\` followed by a real newline.
+> - **Multi-unit symbols are handled as one component.** A multi-unit part is placed as one
+>   instance *per unit*, all sharing the reference, and four tools took the **first** match:
+>   `batch_connect_to_net` transformed every pin by unit 1's placement — silently landing two
+>   nets on one coordinate and shorting them, with no error; `batch_edit_schematic_components`
+>   wrote fields into unit 1 only; the delete tools left the other units behind as orphans;
+>   `bulk_move` tore the part apart. Pin lookups now resolve against the unit that owns the
+>   pin, and component-level edits apply to every unit.
+> - **A schematic KiCad saved survives an edit.** Every tool that round-trips the document
+>   through the typed model re-emitted the *whole* file: two-space indents where eeschema
+>   writes tabs, closing parens inline, and blank lines inserted between top-level items.
+>   Adding one net label to a 40,000-line schematic produced a 66,000-line diff, burying the
+>   real change and discarding the formatting KiCad wrote. The writer now matches eeschema
+>   exactly — including `pts` points wrapping after six and an embedded file's base64 kept
+>   one chunk per line — so a 1.1 MB schematic round-trips byte-for-byte.
+> - **`add_schematic_text` no longer writes an unopenable file.** It spliced the node in after
+>   the symbol instances (KiCad 10 requires those last) and wrote literal newlines where the
+>   format wants `\n`. Either one makes the whole schematic fail to load, while the tool
+>   reports success.
+>
+> **Added tools**
+>
+> - **`sch_bus` toolset** — `add_bus`, `batch_add_bus`, `add_bus_entry`, and
+>   `connect_pins_to_bus`. `SchematicBuilder` already round-tripped bus nodes, but nothing
+>   could create one, so any repeated multi-signal link had to be one wire per signal or bare
+>   labels. `connect_pins_to_bus` writes the stub, the entry *and* the member label per pin,
+>   because bus membership in KiCad is by name — a stub without a label joins nothing.
+> - `set_schematic_page` — sets the sheet size. Content outside the frame still exports and
+>   still nets up, so an undersized page is a silent defect; the tool returns the size in mm
+>   so the caller can check it against the layout.
+> - `batch_add_no_connect` — `batch_delete_no_connect` existed with no batch add; marking one
+>   MCU's unused pins is routinely 15–20 round trips.
+> - `update_symbols_from_library` — eeschema's *Update Symbols from Library*. Refuses any
+>   symbol whose pins moved, since wires and labels sit at the old coordinates.
+> - `rename_project` — renames the project files *and* the internal references. Renaming
+>   files alone orphans every reference designator, because each symbol instance stores
+>   `(project "name")`.
+> - `reload_server` — `exec`s into the rebuilt binary in place, keeping the PID and stdio
+>   pipes so the MCP client's connection survives. Verifies the new binary first.
+> - `set_schematic_field_geometry` — places a symbol's Reference/Value text: an offset from
+>   the symbol origin plus a text angle. Nothing could move a field before —
+>   `edit_schematic_component` changes only what a field *says*. The angle is stored relative
+>   to its symbol, so a field left at 0 on a rotated symbol renders sideways while the file
+>   still reads 0; omitting the angle now cancels the rotation.
+>
+> 533 tests; `cargo clippy --workspace -- -D warnings` clean.
+
 > **Status: beta.** The core toolchain is tested and working, but this is a young
 > release and it wants real-world mileage and review. Issues and PRs are welcome —
 > see [CONTRIBUTING.md](CONTRIBUTING.md) and the
