@@ -10,7 +10,7 @@ Canonical reference for every MCP tool exposed by Konnect. Generated from the Ru
 ## Overview
 
 - **19 toolsets** organized into 10 categories
-- **195 registered tools** + **7 always-visible meta-tools** = **202 total**
+- **196 registered tools** + **7 always-visible meta-tools** = **203 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -57,7 +57,7 @@ Seven tools, grouped into *discovery/routing* and *observability*.
 
 ## Schematic
 
-### `sch_components` · 19 tools
+### `sch_components` · 20 tools
 **Purpose:** Add, edit, move, rotate, and delete schematic symbols.
 **Source:** [`crates/konnect-core/src/tools/sch_components.rs`](crates/konnect-core/src/tools/sch_components.rs)
 
@@ -68,6 +68,7 @@ Seven tools, grouped into *discovery/routing* and *observability*.
 | `add_schematic_component` | Add a symbol from a KiCAD library to the schematic. Snaps to the 1.27mm grid. |
 | `delete_schematic_component` | Remove a symbol instance from the schematic by its reference designator. |
 | `edit_schematic_component` | Update fields (Reference, Value, Footprint, custom properties) of a symbol instance. |
+| `set_schematic_field_geometry` | Position a field's text: offset from the symbol origin, plus text angle. Omit the angle to read horizontally whatever the symbol's rotation. Hides the field name and pins it against autoplace. |
 | `get_schematic_component` | Get all properties, position, and pin locations for a symbol instance. |
 | `list_schematic_components` | List all symbol instances with positions, values, footprints, and pin locations. |
 | `move_schematic_component` | Move a symbol to a new position. Does NOT adjust connected wires. |

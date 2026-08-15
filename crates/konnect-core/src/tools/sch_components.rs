@@ -19,8 +19,8 @@ use konnect_sexp::{
         extract_lib_pins_for_unit, extract_symbol_instances, pin_endpoint, read_schematic,
     },
     writer::{
-        apply_edits, new_uuid, read_consistent, write_atomic_if_unchanged, write_new_atomic,
-        SexpEdit,
+        apply_edits, find_balanced_block, new_uuid, read_consistent, write_atomic_if_unchanged,
+        write_new_atomic, SexpEdit,
     },
     ItemId, SchematicCommand,
 };
@@ -119,6 +119,43 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic", "reference"]
             }),
             |args, ctx| async move { handle_edit_schematic_component(args, ctx).await }
+        ),
+        tool!(
+            "set_schematic_field_geometry",
+            "Position a symbol's Reference/Value/custom field text. `edit_schematic_component` \
+             changes what a field says; this changes where it sits and which way it reads. \
+             Offsets are relative to the symbol's own origin, so they survive moving it. \
+             Omit `angle` to keep the text horizontal on the sheet — a field's stored angle is \
+             relative to its symbol, so a field left at 0 on a symbol rotated 90° renders \
+             sideways. Also sets show_name and do_not_autoplace to no, without which KiCad \
+             prints the field's name beside its value and may shove the field back over the body.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string" },
+                    "reference": { "type": "string", "description": "Symbol to edit, e.g. 'R28'" },
+                    "field": {
+                        "type": "string",
+                        "description": "Field name: Reference, Value, Footprint, or a custom property",
+                        "default": "Reference"
+                    },
+                    "dx": {
+                        "type": "number",
+                        "description": "Field offset from the symbol origin in mm, +x right"
+                    },
+                    "dy": {
+                        "type": "number",
+                        "description": "Field offset from the symbol origin in mm, +y down"
+                    },
+                    "angle": {
+                        "type": "number",
+                        "description": "Text angle relative to the symbol (0/90/180/270). \
+                                        Omit to render horizontal whatever the symbol's rotation."
+                    }
+                },
+                "required": ["schematic", "reference", "dx", "dy"]
+            }),
+            |args, ctx| async move { handle_set_schematic_field_geometry(args, ctx).await }
         ),
         tool!(
             "get_schematic_component",
@@ -607,6 +644,45 @@ async fn handle_delete_schematic_component(
     }
 }
 
+/// The symbol's own placement: `(x, y, rotation)` from its `(at …)`.
+fn symbol_placement(block: &str) -> Option<(f64, f64, f64)> {
+    let at = block.find("(at ")?;
+    let rest = &block[at + 4..];
+    let close = rest.find(')')?;
+    let mut parts = rest[..close].split_whitespace();
+    let x = parts.next()?.parse::<f64>().ok()?;
+    let y = parts.next()?.parse::<f64>().ok()?;
+    // Rotation is optional in the file; absent means 0.
+    let rot = parts
+        .next()
+        .and_then(|r| r.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    Some((x, y, rot))
+}
+
+/// Ensure `(show_name no)` and `(do_not_autoplace no)` sit in a property block.
+///
+/// A property KiCad wrote carries both. One this crate placed carries neither,
+/// and the difference is visible: without `show_name no` eeschema draws
+/// `Reference R28` instead of `R28`, and with autoplace still enabled it is
+/// free to move the field back on top of the symbol body.
+fn ensure_field_flags(prop: &str, indent: &str) -> String {
+    let mut out = prop.to_string();
+    for flag in ["(do_not_autoplace no)", "(show_name no)"] {
+        if out.contains(flag) {
+            continue;
+        }
+        // After the property's own (at …) line, where eeschema puts them.
+        if let Some(at) = out.find("(at ") {
+            if let Some(eol) = out[at..].find('\n') {
+                let insert = at + eol + 1;
+                out.insert_str(insert, &format!("{indent}{flag}\n"));
+            }
+        }
+    }
+    out
+}
+
 async fn handle_edit_schematic_component(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -700,6 +776,133 @@ async fn handle_edit_schematic_component(
         result["errors"] = json!(errors);
     }
     Ok(CallToolResult::json(&result))
+}
+
+async fn handle_set_schematic_field_geometry(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let reference = match require_str(args, "reference") {
+        Ok(r) => r.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let dx = match require_f64(args, "dx") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let dy = match require_f64(args, "dy") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let field = opt_str(args, "field").unwrap_or("Reference").to_string();
+
+    let content = read_consistent(&sch_path)?;
+    let expected = content.clone();
+
+    let (sym_start, sym_end) = match find_symbol_instance_block(&content, &reference) {
+        Some(span) => span,
+        None => {
+            return Ok(CallToolResult::error(format!(
+                "symbol '{reference}' not found in this schematic"
+            )))
+        }
+    };
+    let block = &content[sym_start..sym_end];
+
+    let (sym_x, sym_y, sym_rot) = match symbol_placement(block) {
+        Some(p) => p,
+        None => {
+            return Ok(CallToolResult::error(format!(
+                "'{reference}' has no readable (at …) placement"
+            )))
+        }
+    };
+
+    // A field's angle is relative to its symbol, so the angle that renders
+    // horizontal is whatever cancels the symbol's rotation. Getting this wrong
+    // is silent: the file says 0 and the sheet shows the text on its side.
+    let angle = match opt_f64(args, "angle") {
+        Some(a) => a.rem_euclid(360.0),
+        None => (360.0 - sym_rot).rem_euclid(360.0),
+    };
+
+    let prop_search = format!(r#"(property "{field}" ""#);
+    let prop_rel = match block.find(&prop_search) {
+        Some(o) => o,
+        None => {
+            return Ok(CallToolResult::error(format!(
+                "'{reference}' has no '{field}' property"
+            )))
+        }
+    };
+    let prop_abs = sym_start + prop_rel;
+    let (prop_start, prop_end) = match find_balanced_block(&content, prop_abs) {
+        Some(span) => span,
+        None => {
+            return Ok(CallToolResult::error(format!(
+                "'{field}' property on '{reference}' is malformed"
+            )))
+        }
+    };
+
+    // Match the file's own indentation — eeschema writes tabs, older Konnect
+    // writes spaces, and a hard-coded guess mangles whichever it is not.
+    let line_start = content[..prop_start].rfind('\n').map_or(0, |n| n + 1);
+    let prop_indent = content[line_start..prop_start].to_string();
+    let inner_indent = format!("{prop_indent}\t");
+
+    let prop = &content[prop_start..prop_end];
+    let (fx, fy) = (sym_x + dx, sym_y + dy);
+    let at_search = match prop.find("(at ") {
+        Some(o) => o,
+        None => {
+            return Ok(CallToolResult::error(format!(
+                "'{field}' property on '{reference}' has no (at …) to move"
+            )))
+        }
+    };
+    let at_close = match prop[at_search..].find(')') {
+        Some(o) => at_search + o + 1,
+        None => {
+            return Ok(CallToolResult::error(format!(
+                "'{field}' property on '{reference}' has a malformed (at …)"
+            )))
+        }
+    };
+
+    let mut new_prop = String::with_capacity(prop.len() + 64);
+    new_prop.push_str(&prop[..at_search]);
+    new_prop.push_str(&format!("(at {fx} {fy} {angle})"));
+    new_prop.push_str(&prop[at_close..]);
+    let new_prop = ensure_field_flags(&new_prop, &inner_indent);
+
+    let updated = format!(
+        "{}{}{}",
+        &content[..prop_start],
+        new_prop,
+        &content[prop_end..]
+    );
+
+    let item_id = symbol_item_id(&expected, &reference)?;
+    let command = SchematicCommand::replace_item_from_document(
+        &expected,
+        &updated,
+        item_id,
+        format!("Set {reference} {field} geometry"),
+    )?;
+    commit_command(&sch_path, &command)?;
+
+    Ok(CallToolResult::json(&json!({
+        "reference": reference,
+        "field": field,
+        "dx": dx,
+        "dy": dy,
+        "x": fx,
+        "y": fy,
+        "angle": angle,
+        "symbol_rotation": sym_rot
+    })))
 }
 
 async fn handle_get_schematic_component(
@@ -2288,5 +2491,155 @@ mod page_tests {
         for (n, w, h) in PAPER_SIZES {
             assert!(w > h, "{n} is listed portrait; the table is landscape");
         }
+    }
+}
+
+/// `set_schematic_field_geometry` exists because placement is only half of
+/// putting a symbol on a sheet: a symbol whose Reference sits on top of its own
+/// body is wrong, and until this tool there was no way to move it — the closest
+/// tool, `edit_schematic_component`, changes a field's text and never its
+/// position. The angle is the part that bites: it is stored relative to the
+/// symbol, so a field left at 0 on a rotated symbol renders on its side.
+#[cfg(test)]
+mod field_geometry_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use serde_json::json;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    /// R1 upright, R2 rotated 90° — the case whose field angle must be
+    /// cancelled. Tab-indented, as eeschema saves.
+    const SCH: &str = "(kicad_sch\n\t(version 20250610)\n\t(generator \"eeschema\")\n\t(uuid \"root\")\n\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(at 50 60 0)\n\t\t(unit 1)\n\t\t(uuid \"sym-1\")\n\t\t(property \"Reference\" \"R1\"\n\t\t\t(at 50 56.19 0)\n\t\t)\n\t\t(property \"Value\" \"10k\"\n\t\t\t(at 50 63.81 0)\n\t\t)\n\t)\n\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(at 100 60 90)\n\t\t(unit 1)\n\t\t(uuid \"sym-2\")\n\t\t(property \"Reference\" \"R2\"\n\t\t\t(at 100 56.19 0)\n\t\t)\n\t\t(property \"Value\" \"4k7\"\n\t\t\t(at 100 63.81 0)\n\t\t)\n\t)\n)\n";
+
+    async fn set_geometry(args: serde_json::Value) -> (String, String) {
+        let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        f.write_all(SCH.as_bytes()).unwrap();
+        f.flush().unwrap();
+
+        let mut args = args;
+        args["schematic"] = json!(f.path().to_str().unwrap());
+
+        let def = tools()
+            .into_iter()
+            .find(|t| t.name == "set_schematic_field_geometry")
+            .unwrap();
+        let ctx = Arc::new(ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        ));
+        let res = (def.handler)(&args, ctx).await.unwrap();
+        let reply = match res.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        (std::fs::read_to_string(f.path()).unwrap(), reply)
+    }
+
+    #[tokio::test]
+    async fn the_offset_is_relative_to_the_symbol() {
+        let (out, _) = set_geometry(
+            json!({ "reference": "R1", "field": "Reference", "dx": 2.54, "dy": -1.78 }),
+        )
+        .await;
+        assert!(
+            out.contains("(at 52.54 58.22 0)"),
+            "R1 sits at (50,60), so +2.54/-1.78 is (52.54, 58.22):\n{out}"
+        );
+    }
+
+    /// The whole reason the tool computes an angle at all.
+    #[tokio::test]
+    async fn an_omitted_angle_cancels_the_symbol_rotation() {
+        let (out, reply) =
+            set_geometry(json!({ "reference": "R2", "field": "Reference", "dx": 0, "dy": -3.81 }))
+                .await;
+        assert!(
+            out.contains("(at 100 56.19 270)"),
+            "a field on a 90°-rotated symbol needs 270 to read horizontally:\n{out}"
+        );
+        assert!(reply.contains("\"angle\":270.0"), "reported back: {reply}");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_angle_is_honoured() {
+        let (out, _) = set_geometry(
+            json!({ "reference": "R1", "field": "Value", "dx": 3.05, "dy": 0, "angle": 90 }),
+        )
+        .await;
+        assert!(
+            out.contains("(at 53.05 60 90)"),
+            "explicit angle kept:\n{out}"
+        );
+    }
+
+    /// Without these, eeschema draws "Reference R1" and may autoplace the field
+    /// straight back over the symbol body.
+    #[tokio::test]
+    async fn the_field_is_pinned_and_its_name_hidden() {
+        let (out, _) = set_geometry(
+            json!({ "reference": "R1", "field": "Reference", "dx": 2.54, "dy": -1.78 }),
+        )
+        .await;
+        assert!(out.contains("(show_name no)"), "show_name added:\n{out}");
+        assert!(
+            out.contains("(do_not_autoplace no)"),
+            "autoplace pinned:\n{out}"
+        );
+    }
+
+    /// Editing one field must not re-indent a file eeschema saved.
+    #[tokio::test]
+    async fn tab_indentation_survives() {
+        let (out, _) = set_geometry(
+            json!({ "reference": "R1", "field": "Reference", "dx": 2.54, "dy": -1.78 }),
+        )
+        .await;
+        assert!(
+            !out.lines().any(|l| l.starts_with(' ')),
+            "a space-indented line means the file was reformatted:\n{out}"
+        );
+    }
+
+    /// Only the named field moves.
+    #[tokio::test]
+    async fn a_sibling_field_is_left_alone() {
+        let (out, _) = set_geometry(
+            json!({ "reference": "R1", "field": "Reference", "dx": 2.54, "dy": -1.78 }),
+        )
+        .await;
+        assert!(
+            out.contains("(property \"Value\" \"10k\"\n\t\t\t(at 50 63.81 0)"),
+            "R1's Value must be untouched:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_field_is_reported_not_ignored() {
+        let (_, reply) =
+            set_geometry(json!({ "reference": "R1", "field": "Nope", "dx": 0, "dy": 0 })).await;
+        assert!(
+            reply.contains("no 'Nope' property"),
+            "the refusal names the field: {reply}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_reference_is_reported() {
+        let (_, reply) =
+            set_geometry(json!({ "reference": "R99", "field": "Reference", "dx": 0, "dy": 0 }))
+                .await;
+        assert!(
+            reply.contains("R99"),
+            "the refusal names the symbol: {reply}"
+        );
     }
 }
