@@ -9,6 +9,18 @@
 //! silkscreen at the old location, detached from the anchor. Before sending
 //! `UpdateItems`, every child must get the same rigid-body transform KiCAD
 //! would apply natively (`FOOTPRINT::SetPosition` / `SetOrientation`).
+//!
+//! # Known loss: `(units …)`
+//!
+//! `kiapi.board.types.Footprint` has no field for a footprint's `(units …)`
+//! block — KiCAD 10's pin grouping, used for pin and gate swap — so the
+//! round-trip drops it and KiCAD re-creates the footprint without it. This
+//! hits every tool that updates a `FootprintInstance` over IPC: move, rotate
+//! and flip alike, not any one of them in particular. Measured on a
+//! 79-footprint board: all 18 footprints driven over IPC lost the block and
+//! all 61 untouched ones kept it. Connectivity, geometry and layers are
+//! unaffected — only the swap metadata goes. Restore it with a file-level
+//! pass if a design relies on pin swapping.
 
 use crate::gen::kiapi;
 use anyhow::Result;
