@@ -946,6 +946,61 @@ impl KiCadIpcClient {
         anyhow::bail!("Footprint '{}' not found", reference)
     }
 
+    /// Flip a footprint to the other side of the board, as pcbnew's `F` does.
+    ///
+    /// The anchor stays put; everything else mirrors about the horizontal line
+    /// through it and crosses to the opposite layer. Returns true if the
+    /// footprint ended up on the back.
+    ///
+    /// `side` picks the destination: `Some(true)` back, `Some(false)` front,
+    /// `None` to toggle. Asking for the side it is already on is a no-op, so
+    /// flipping a whole selection twice cannot half-undo itself.
+    pub fn flip_footprint(&self, reference: &str, side: Option<bool>) -> Result<bool> {
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        for item in &items {
+            if let Ok(mut fp) =
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            {
+                let ref_text = fp
+                    .reference_field
+                    .as_ref()
+                    .and_then(|f| f.text.as_ref())
+                    .and_then(|bt| bt.text.as_ref())
+                    .map(|t| t.text.as_str())
+                    .unwrap_or("");
+                if ref_text != reference {
+                    continue;
+                }
+
+                let back = kiapi::board::types::BoardLayer::BlBCu as i32;
+                let front = kiapi::board::types::BoardLayer::BlFCu as i32;
+                let on_back = fp.layer == back;
+                let want_back = side.unwrap_or(!on_back);
+                if want_back == on_back {
+                    return Ok(on_back);
+                }
+
+                fp.layer = if want_back { back } else { front };
+                // KiCAD negates the body angle when a footprint changes side.
+                if let Some(a) = fp.orientation.as_mut() {
+                    a.value_degrees = -a.value_degrees;
+                }
+                // Children are carried in absolute board coordinates, so they
+                // must be mirrored about the anchor and crossed to the
+                // opposite layers here (issue #23).
+                let anchor = fp.position.unwrap_or_default();
+                crate::transform::transform_footprint_children(
+                    &mut fp,
+                    &crate::transform::Xform::Mirror { cy_nm: anchor.y_nm },
+                )?;
+                let any = crate::builders::pack_any(&fp, "kiapi.board.types.FootprintInstance");
+                self.update_items(vec![any])?;
+                return Ok(want_back);
+            }
+        }
+        anyhow::bail!("Footprint '{}' not found", reference)
+    }
+
     /// Rotate a footprint to a new angle.
     pub fn rotate_footprint(&self, reference: &str, angle: f64) -> Result<()> {
         let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;

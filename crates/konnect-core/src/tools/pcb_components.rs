@@ -7,7 +7,7 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::library::{footprint_lib_nickname_for_dir, is_lib_id, resolve_footprint_path};
-use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
+use crate::tools::{get_path, opt_str, require_f64, require_str, ToolContext, ToolDef};
 use anyhow::Context;
 use konnect_ipc::client::KiCadIpcClient;
 use konnect_sexp::writer::{
@@ -909,6 +909,31 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_rotate_component(args, ctx).await }
         ),
         tool!(
+            "flip_component",
+            "Flip a footprint to the other side of the board, as pressing F does in \
+             pcbnew. The position stays put; the footprint mirrors about the horizontal \
+             line through its anchor and every pad, silkscreen and courtyard crosses to \
+             the opposite layer. Use this to put parts on the back — `place_component`'s \
+             layer argument only applies to a footprint being added, and `move_component` \
+             cannot change side. Asking for the side it is already on does nothing, so \
+             flipping a group twice cannot half-undo itself.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":     { "type": "string" },
+                    "reference": { "type": "string", "description": "Reference designator, e.g. 'U1'" },
+                    "side": {
+                        "type": "string",
+                        "enum": ["front", "back", "toggle"],
+                        "description": "Destination side. Defaults to 'toggle'.",
+                        "default": "toggle"
+                    }
+                },
+                "required": ["board", "reference"]
+            }),
+            |args, ctx| async move { handle_flip_component(args, ctx).await }
+        ),
+        tool!(
             "delete_component",
             "Remove a footprint from the board via KiCAD IPC.",
             json!({
@@ -1221,6 +1246,33 @@ async fn handle_rotate_component(
     Ok(CallToolResult::json(
         &json!({ "rotated": reference, "rotation": rotation }),
     ))
+}
+
+async fn handle_flip_component(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let reference = match require_str(args, "reference") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let side = match opt_str(args, "side").unwrap_or("toggle") {
+        "back" => Some(true),
+        "front" => Some(false),
+        "toggle" => None,
+        other => {
+            return Ok(CallToolResult::error(format!(
+                "side must be 'front', 'back' or 'toggle', got '{other}'"
+            )))
+        }
+    };
+
+    let ref_ipc = reference.clone();
+    let on_back = ipc!(ctx, args, |c| c.flip_footprint(&ref_ipc, side));
+    Ok(CallToolResult::json(&json!({
+        "flipped": reference,
+        "side": if on_back { "back" } else { "front" },
+    })))
 }
 
 async fn handle_delete_component(

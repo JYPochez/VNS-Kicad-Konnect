@@ -28,6 +28,24 @@ pub enum Xform {
         cy_nm: i64,
         delta_deg: f64,
     },
+    /// Flip to the other side of the board: mirror every child about the
+    /// horizontal line `y = cy_nm`, leaving x alone.
+    ///
+    /// Angles do not all move together, which is the trap. Measured against
+    /// KiCAD 10 by flipping one footprint at 0° and the same footprint at 90°
+    /// and diffing the board file:
+    ///
+    /// |                       | at 0°       | at 90°     | rule      |
+    /// |-----------------------|-------------|------------|-----------|
+    /// | footprint orientation | 0 → 0       | 90 → −90   | `−θ`      |
+    /// | pad angle             | 0 → 0       | 90 → 270   | `−θ`      |
+    /// | text angle            | 0 → **180** | 90 → **90**| `180 − θ` |
+    ///
+    /// The 0° case alone cannot separate `180 − θ` from `θ + 180` — they agree
+    /// there. The 90° case does, and `θ + 180` is wrong: it puts text at 270
+    /// and silently mirrors the lettering on every rotated part. Text also
+    /// gains a `mirrored` attribute so it still reads from the back.
+    Mirror { cy_nm: i64 },
 }
 
 impl Xform {
@@ -48,20 +66,84 @@ impl Xform {
                     cy_nm + (ry * c - rx * s).round() as i64,
                 )
             }
+            Xform::Mirror { cy_nm } => (x, 2 * cy_nm - y),
         }
     }
 
     fn angle_delta_deg(&self) -> f64 {
         match *self {
-            Xform::Translate { .. } => 0.0,
+            Xform::Translate { .. } | Xform::Mirror { .. } => 0.0,
             Xform::Rotate { delta_deg, .. } => delta_deg,
         }
     }
 
-    /// True when the rotation keeps axis-aligned shapes axis-aligned.
+    /// The angle a pad or the footprint itself takes after this transform.
+    fn body_angle(&self, deg: f64) -> f64 {
+        match *self {
+            Xform::Mirror { .. } => normalize_deg(-deg),
+            _ => normalize_deg(deg + self.angle_delta_deg()),
+        }
+    }
+
+    /// The angle a text item takes after this transform. Differs from
+    /// [`Self::body_angle`] under a mirror — see [`Xform::Mirror`].
+    fn text_angle(&self, deg: f64) -> f64 {
+        match *self {
+            Xform::Mirror { .. } => normalize_deg(180.0 - deg),
+            _ => normalize_deg(deg + self.angle_delta_deg()),
+        }
+    }
+
+    fn is_mirror(&self) -> bool {
+        matches!(*self, Xform::Mirror { .. })
+    }
+
+    /// True when the transform keeps axis-aligned shapes axis-aligned. A
+    /// mirror about a horizontal axis always does.
     fn is_cardinal(&self) -> bool {
+        if self.is_mirror() {
+            return true;
+        }
         let r = self.angle_delta_deg().rem_euclid(90.0);
         r.abs() < 1e-9 || (90.0 - r).abs() < 1e-9
+    }
+}
+
+/// The layer an item moves to when its footprint is flipped. Layers with no
+/// opposite side (User.*, Edge.Cuts, the inner copper layers) stay put.
+pub fn mirrored_layer(layer: i32) -> i32 {
+    use board::BoardLayer as L;
+    const PAIRS: [(L, L); 7] = [
+        (L::BlFCu, L::BlBCu),
+        (L::BlFAdhes, L::BlBAdhes),
+        (L::BlFPaste, L::BlBPaste),
+        (L::BlFSilkS, L::BlBSilkS),
+        (L::BlFMask, L::BlBMask),
+        (L::BlFCrtYd, L::BlBCrtYd),
+        (L::BlFFab, L::BlBFab),
+    ];
+    for (front, back) in PAIRS {
+        if layer == front as i32 {
+            return back as i32;
+        }
+        if layer == back as i32 {
+            return front as i32;
+        }
+    }
+    layer
+}
+
+fn mirror_layer_in_place(layer: &mut i32, xf: &Xform) {
+    if xf.is_mirror() {
+        *layer = mirrored_layer(*layer);
+    }
+}
+
+fn mirror_layers_in_place(layers: &mut [i32], xf: &Xform) {
+    if xf.is_mirror() {
+        for l in layers.iter_mut() {
+            *l = mirrored_layer(*l);
+        }
     }
 }
 
@@ -84,21 +166,39 @@ fn xform_vec2(v: &mut Option<common::Vector2>, xf: &Xform) {
     }
 }
 
+/// Angle of a pad or the footprint body: `-θ` under a mirror, `θ + delta`
+/// otherwise.
 fn xform_angle(a: &mut Option<common::Angle>, xf: &Xform) {
-    let delta = xf.angle_delta_deg();
-    if delta != 0.0 {
-        let base = a.as_ref().map(|x| x.value_degrees).unwrap_or(0.0);
-        *a = Some(common::Angle {
-            value_degrees: normalize_deg(base + delta),
-        });
+    if xf.angle_delta_deg() == 0.0 && !xf.is_mirror() {
+        return;
     }
+    let base = a.as_ref().map(|x| x.value_degrees).unwrap_or(0.0);
+    *a = Some(common::Angle {
+        value_degrees: xf.body_angle(base),
+    });
+}
+
+/// Angle of a text item: `180 - θ` under a mirror, `θ + delta` otherwise.
+fn xform_text_angle(a: &mut Option<common::Angle>, xf: &Xform) {
+    if xf.angle_delta_deg() == 0.0 && !xf.is_mirror() {
+        return;
+    }
+    let base = a.as_ref().map(|x| x.value_degrees).unwrap_or(0.0);
+    *a = Some(common::Angle {
+        value_degrees: xf.text_angle(base),
+    });
 }
 
 fn xform_text(t: &mut Option<common::Text>, xf: &Xform) {
     if let Some(text) = t.as_mut() {
         xform_vec2(&mut text.position, xf);
         if let Some(attrs) = text.attributes.as_mut() {
-            xform_angle(&mut attrs.angle, xf);
+            xform_text_angle(&mut attrs.angle, xf);
+            // Flipped lettering has to read from the other side, so KiCAD
+            // toggles the mirror attribute rather than rotating the glyphs.
+            if xf.is_mirror() {
+                attrs.mirrored = !attrs.mirrored;
+            }
         }
     }
 }
@@ -111,6 +211,9 @@ fn xform_field(f: &mut Option<board::Field>, xf: &Xform) {
     if let Some(field) = f.as_mut() {
         if let Some(text) = field.text.as_mut() {
             xform_board_text(text, xf);
+            // Reference and Value sit on F.SilkS / F.Fab and have to cross
+            // with the rest of the footprint.
+            mirror_layer_in_place(&mut text.layer, xf);
         }
     }
 }
@@ -285,11 +388,13 @@ pub fn transform_footprint_children(fp: &mut board::FootprintInstance, xf: &Xfor
             xform_vec2(&mut pad.position, xf);
             if let Some(ps) = pad.pad_stack.as_mut() {
                 xform_angle(&mut ps.angle, xf);
+                mirror_layers_in_place(&mut ps.layers, xf);
             }
             item.value = pad.encode_to_vec();
         } else if url.ends_with("kiapi.board.types.BoardText") {
             let mut text = board::BoardText::decode(item.value.as_slice())?;
             xform_board_text(&mut text, xf);
+            mirror_layer_in_place(&mut text.layer, xf);
             item.value = text.encode_to_vec();
         } else if url.ends_with("kiapi.board.types.BoardTextBox") {
             if !xf.is_cardinal() {
@@ -303,23 +408,30 @@ pub fn transform_footprint_children(fp: &mut board::FootprintInstance, xf: &Xfor
                 xform_vec2(&mut textbox.top_left, xf);
                 xform_vec2(&mut textbox.bottom_right, xf);
                 if let Some(attrs) = textbox.attributes.as_mut() {
-                    xform_angle(&mut attrs.angle, xf);
+                    xform_text_angle(&mut attrs.angle, xf);
+                    if xf.is_mirror() {
+                        attrs.mirrored = !attrs.mirrored;
+                    }
                 }
             }
+            mirror_layer_in_place(&mut tb.layer, xf);
             item.value = tb.encode_to_vec();
         } else if url.ends_with("kiapi.board.types.Field") {
             let mut field = board::Field::decode(item.value.as_slice())?;
             if let Some(text) = field.text.as_mut() {
                 xform_board_text(text, xf);
+                mirror_layer_in_place(&mut text.layer, xf);
             }
             item.value = field.encode_to_vec();
         } else if url.ends_with("kiapi.board.types.BoardGraphicShape") {
             let mut shape = board::BoardGraphicShape::decode(item.value.as_slice())?;
             xform_graphic_shape(&mut shape, xf)?;
+            mirror_layer_in_place(&mut shape.layer, xf);
             item.value = shape.encode_to_vec();
         } else if url.ends_with("kiapi.board.types.Zone") {
             let mut zone = board::Zone::decode(item.value.as_slice())?;
             xform_zone(&mut zone, xf);
+            mirror_layers_in_place(&mut zone.layers, xf);
             item.value = zone.encode_to_vec();
         } else if url.ends_with("kiapi.board.types.Dimension") {
             let mut dim = board::Dimension::decode(item.value.as_slice())?;
@@ -542,5 +654,197 @@ mod tests {
         };
         transform_footprint_children(&mut fp, &xf).unwrap();
         assert_eq!(fp.definition.unwrap().items[0].value, original);
+    }
+}
+
+/// Flip semantics, measured against KiCAD 10 rather than assumed: one 0805 was
+/// flipped at 0° and the same footprint again at 90°, and the board file
+/// diffed. See [`Xform::Mirror`] for the table those diffs produced.
+#[cfg(test)]
+mod mirror_tests {
+    use super::*;
+    use crate::builders;
+
+    fn text_at(x_mm: f64, y_mm: f64, angle_deg: f64, layer: board::BoardLayer) -> board::BoardText {
+        board::BoardText {
+            text: Some(common::Text {
+                position: Some(builders::vec2(x_mm, y_mm)),
+                attributes: Some(common::TextAttributes {
+                    angle: Some(common::Angle {
+                        value_degrees: angle_deg,
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            layer: layer as i32,
+            ..Default::default()
+        }
+    }
+
+    fn pad_on_front(x_mm: f64, y_mm: f64, angle_deg: f64) -> board::Pad {
+        use board::BoardLayer as L;
+        board::Pad {
+            position: Some(builders::vec2(x_mm, y_mm)),
+            pad_stack: Some(board::PadStack {
+                angle: Some(common::Angle {
+                    value_degrees: angle_deg,
+                }),
+                layers: vec![L::BlFCu as i32, L::BlFMask as i32, L::BlFPaste as i32],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn mirror_negates_y_about_the_anchor_and_leaves_x() {
+        let xf = Xform::Mirror {
+            cy_nm: builders::mm_to_nm(100.0),
+        };
+        let pad = builders::pack_any(&pad_on_front(105.0, 98.35, 0.0), "kiapi.board.types.Pad");
+        let mut fp = board::FootprintInstance {
+            position: Some(builders::vec2(100.0, 100.0)),
+            definition: Some(board::Footprint {
+                items: vec![pad],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        transform_footprint_children(&mut fp, &xf).unwrap();
+
+        let pad =
+            board::Pad::decode(fp.definition.as_ref().unwrap().items[0].value.as_slice()).unwrap();
+        // x untouched, y reflected: 98.35 is 1.65 above the anchor, so it
+        // lands 1.65 below it.
+        assert_eq!(pad.position.unwrap(), builders::vec2(105.0, 101.65));
+    }
+
+    /// The whole point of the measurement: at 0° a pad and a text move the
+    /// same way, so 0° alone cannot tell `180 - θ` from `θ + 180`.
+    #[test]
+    fn an_unrotated_flip_cannot_distinguish_the_two_text_rules() {
+        let xf = Xform::Mirror { cy_nm: 0 };
+        assert_eq!(xf.body_angle(0.0), 0.0);
+        assert_eq!(xf.text_angle(0.0), 180.0);
+    }
+
+    /// At 90° they diverge, and this is the case that proves the rule.
+    /// `θ + 180` would give 270 here and silently mirror the lettering on
+    /// every rotated part.
+    #[test]
+    fn a_rotated_flip_negates_the_body_but_reflects_the_text() {
+        let xf = Xform::Mirror { cy_nm: 0 };
+        assert_eq!(xf.body_angle(90.0), -90.0, "KiCAD wrote -90 for the body");
+        assert_eq!(xf.text_angle(90.0), 90.0, "KiCAD left the text at 90");
+        assert_ne!(
+            xf.text_angle(90.0),
+            270.0,
+            "θ + 180 is the wrong rule; it was ruled out by measurement"
+        );
+    }
+
+    #[test]
+    fn pad_angles_negate_and_pad_layers_cross_to_the_back() {
+        use board::BoardLayer as L;
+        let xf = Xform::Mirror {
+            cy_nm: builders::mm_to_nm(100.0),
+        };
+        let pad = builders::pack_any(&pad_on_front(100.0, 100.0, 90.0), "kiapi.board.types.Pad");
+        let mut fp = board::FootprintInstance {
+            position: Some(builders::vec2(100.0, 100.0)),
+            definition: Some(board::Footprint {
+                items: vec![pad],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        transform_footprint_children(&mut fp, &xf).unwrap();
+
+        let pad =
+            board::Pad::decode(fp.definition.as_ref().unwrap().items[0].value.as_slice()).unwrap();
+        let ps = pad.pad_stack.unwrap();
+        assert_eq!(ps.angle.unwrap().value_degrees, -90.0);
+        assert_eq!(
+            ps.layers,
+            vec![L::BlBCu as i32, L::BlBMask as i32, L::BlBPaste as i32]
+        );
+    }
+
+    #[test]
+    fn text_crosses_layer_and_gains_the_mirror_attribute() {
+        use board::BoardLayer as L;
+        let xf = Xform::Mirror { cy_nm: 0 };
+        let txt = builders::pack_any(
+            &text_at(0.0, -1.65, 0.0, L::BlFSilkS),
+            "kiapi.board.types.BoardText",
+        );
+        let mut fp = board::FootprintInstance {
+            position: Some(builders::vec2(0.0, 0.0)),
+            definition: Some(board::Footprint {
+                items: vec![txt],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        transform_footprint_children(&mut fp, &xf).unwrap();
+
+        let t = board::BoardText::decode(fp.definition.as_ref().unwrap().items[0].value.as_slice())
+            .unwrap();
+        assert_eq!(t.layer, L::BlBSilkS as i32);
+        let inner = t.text.unwrap();
+        assert_eq!(inner.position.unwrap(), builders::vec2(0.0, 1.65));
+        let attrs = inner.attributes.unwrap();
+        assert_eq!(attrs.angle.unwrap().value_degrees, 180.0);
+        assert!(attrs.mirrored, "flipped lettering must read from the back");
+    }
+
+    #[test]
+    fn the_mandatory_fields_cross_layers_too() {
+        use board::BoardLayer as L;
+        let mut fp = board::FootprintInstance {
+            position: Some(builders::vec2(0.0, 0.0)),
+            reference_field: Some(board::Field {
+                text: Some(text_at(0.0, -1.65, 0.0, L::BlFSilkS)),
+                ..Default::default()
+            }),
+            value_field: Some(board::Field {
+                text: Some(text_at(0.0, 1.65, 0.0, L::BlFFab)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        transform_footprint_children(&mut fp, &Xform::Mirror { cy_nm: 0 }).unwrap();
+
+        let r = fp.reference_field.unwrap().text.unwrap();
+        let v = fp.value_field.unwrap().text.unwrap();
+        assert_eq!(r.layer, L::BlBSilkS as i32);
+        assert_eq!(v.layer, L::BlBFab as i32);
+        // Reference started 1.65 above the anchor and ends the same below it.
+        assert_eq!(r.text.unwrap().position.unwrap(), builders::vec2(0.0, 1.65));
+    }
+
+    #[test]
+    fn layers_without_an_opposite_side_stay_put() {
+        use board::BoardLayer as L;
+        for keep in [L::BlEdgeCuts, L::BlUser1, L::BlIn1Cu] {
+            assert_eq!(
+                mirrored_layer(keep as i32),
+                keep as i32,
+                "{keep:?} has no other side"
+            );
+        }
+    }
+
+    #[test]
+    fn mirroring_twice_is_the_identity() {
+        use board::BoardLayer as L;
+        for l in [L::BlFCu, L::BlBSilkS, L::BlFFab, L::BlBCrtYd, L::BlFPaste] {
+            assert_eq!(mirrored_layer(mirrored_layer(l as i32)), l as i32);
+        }
+        let xf = Xform::Mirror { cy_nm: 12_345 };
+        assert_eq!(xf.point(7, 999), (7, 2 * 12_345 - 999));
+        assert_eq!(xf.body_angle(xf.body_angle(37.0)), 37.0);
+        assert_eq!(xf.text_angle(xf.text_angle(37.0)), 37.0);
     }
 }
