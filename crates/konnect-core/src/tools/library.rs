@@ -1169,6 +1169,48 @@ pub(crate) fn resolve_footprint_path(
     ))
 }
 
+/// Directory of the footprint library `nick`, for writing a new footprint
+/// into it.
+///
+/// Same lookup order as `resolve_footprint_path` — project table, global
+/// table, then the bundled `<nick>.pretty` directories — but it needs only the
+/// library to exist, not any particular footprint in it.
+pub(crate) fn footprint_lib_dir(nick: &str, project_dir: Option<&Path>) -> Result<PathBuf, String> {
+    let mut libs = Vec::new();
+    if let Some(project) = project_dir.map(|d| d.join("fp-lib-table")) {
+        libs.extend(read_flat_lib_table(&project));
+    }
+    libs.extend(read_flat_lib_table(&global_fp_lib_table()));
+
+    if let Some(lib) = libs.iter().find(|l| l["nickname"].as_str() == Some(nick)) {
+        let dir = lib["path"].as_str().map(PathBuf::from).ok_or_else(|| {
+            format!(
+                "Library '{}' has an unresolvable URI '{}'",
+                nick,
+                lib["uri"].as_str().unwrap_or("")
+            )
+        })?;
+        if !dir.is_dir() {
+            return Err(format!(
+                "Library '{}' points at a missing directory {}",
+                nick,
+                dir.display()
+            ));
+        }
+        return Ok(dir);
+    }
+    super::find_kicad_library_dirs("footprints")
+        .into_iter()
+        .map(|base| base.join(format!("{nick}.pretty")))
+        .find(|p| p.is_dir())
+        .ok_or_else(|| {
+            format!(
+                "Library '{}' not found in the project or global fp-lib-table",
+                nick
+            )
+        })
+}
+
 /// Extract a quoted string value from `(key "value")` within a block.
 fn extract_sexp_string(block: &str, key: &str) -> Option<String> {
     let pat = format!("({} \"", key);

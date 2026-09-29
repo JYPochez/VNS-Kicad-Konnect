@@ -92,9 +92,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "library",
-        description: "Symbol libraries, footprint libraries, search and registration",
+        description: "Symbol libraries, footprint libraries, search and registration, footprint graphics and copies",
         category: "library",
-        tool_count: 14,
+        tool_count: 16,
     },
     ToolsetMeta {
         name: "integration",
@@ -150,7 +150,7 @@ pub fn tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "pcb_components" => Some(pcb_components::tools()),
         "pcb_routing" => Some(pcb_routing::tools()),
         "pcb_export" => Some(pcb_export::tools()),
-        "library" => Some(library::tools()),
+        "library" => Some([library::tools(), library_graphics::tools()].concat()),
         "integration" => Some(integration::tools()),
         "verification" => Some(verification::tools()),
         "config" => Some(config::tools()),
