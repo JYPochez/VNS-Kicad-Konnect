@@ -91,7 +91,20 @@ that teach Claude KiCAD conventions out of the box.
 >   to its symbol, so a field left at 0 on a rotated symbol renders sideways while the file
 >   still reads 0; omitting the angle now cancels the rotation.
 >
-> 533 tests; `cargo clippy --workspace -- -D warnings` clean.
+> - `flip_component` — moves a footprint to the other side of the board, as **F** does in
+>   pcbnew. KiCad's IPC API has no flip command, so the semantics were measured against
+>   pcbnew rather than guessed: orientation and pad angles become `-θ`, text angles
+>   `180 - θ`, and every pad, graphic and courtyard crosses to the opposite layer.
+> - `edit_footprint_graphics` — lists, edits, deletes and adds a `.kicad_mod`'s lines,
+>   rectangles, arcs, circles, polygons, texts and fields on any layer. `edit_footprint_pad`
+>   could only change pads, so a silkscreen outline running through a pad or across a milled
+>   slot had to be fixed by hand. Items are addressed by index against the file as read,
+>   every operation in a call lands atomically, and only the touched sub-expressions are
+>   rewritten.
+> - `copy_footprint` — copies a footprint into a library under a new name, so a stock
+>   footprint can be varied without editing the stock library.
+>
+> 548 tests; `cargo clippy --workspace -- -D warnings` clean.
 
 > **Status: beta.** The core toolchain is tested and working, but this is a young
 > release and it wants real-world mileage and review. Issues and PRs are welcome —
