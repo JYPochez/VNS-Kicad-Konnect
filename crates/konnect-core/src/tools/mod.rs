@@ -17,6 +17,7 @@ pub mod sch_batch;
 pub mod sch_bridge;
 pub mod sch_bus;
 pub mod sch_components;
+pub mod sch_edit;
 pub mod sch_export;
 pub mod sch_hierarchy;
 pub mod sch_wiring;

@@ -67,7 +67,7 @@ Seven tools, grouped into *discovery/routing* and *observability*.
 | `set_schematic_page` | Set the sheet's paper size (A0–A5, A–E, US Letter/Legal/Ledger) and orientation. Returns the size in mm — content outside the frame still exports and still nets up, so a too-small page is a silent defect. |
 | `add_schematic_component` | Add a symbol from a KiCAD library to the schematic. Snaps to the 1.27mm grid. |
 | `delete_schematic_component` | Remove a symbol instance from the schematic by its reference designator. |
-| `edit_schematic_component` | Update fields (Reference, Value, Footprint, custom properties) of a symbol instance. |
+| `edit_schematic_component` | Update a component's Reference, Value, Footprint or Datasheet, on every unit of a multi-unit part. A rename also updates the `(instances …)` reference eeschema reads, and is refused if the new reference is taken; `uuid` selects one placement, to fix two symbols sharing a reference. |
 | `set_schematic_field_geometry` | Position a field's text: offset from the symbol origin, plus text angle. Omit the angle to read horizontally whatever the symbol's rotation. Hides the field name and pins it against autoplace. |
 | `get_schematic_component` | Get all properties, position, and pin locations for a symbol instance. |
 | `list_schematic_components` | List all symbol instances with positions, values, footprints, and pin locations. |

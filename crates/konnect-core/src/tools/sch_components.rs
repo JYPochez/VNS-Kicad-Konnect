@@ -101,12 +101,17 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "edit_schematic_component",
-            "Update fields (Reference, Value, Footprint, custom properties) of a symbol instance.",
+            "Update the Reference, Value, Footprint or Datasheet of a component. Applies to every \
+             unit of a multi-unit part. A rename also updates the reference in the symbol's \
+             (instances …) entry, which is the one eeschema actually reads, and is refused if \
+             the new reference is already taken. To fix two different symbols that share a \
+             reference (eeschema: \"Duplicate items\"), pass `uuid` to rename just one of them.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string" },
                     "reference": { "type": "string", "description": "Current reference designator" },
+                    "uuid": { "type": "string", "description": "Optional: edit only the placed symbol with this UUID (see list_schematic_components)" },
                     "new_reference": { "type": "string", "description": "New reference designator (optional)" },
                     "value": { "type": "string", "description": "New value (optional)" },
                     "footprint": { "type": "string", "description": "New footprint (optional)" },
@@ -118,7 +123,7 @@ pub fn tools() -> Vec<ToolDef> {
                 },
                 "required": ["schematic", "reference"]
             }),
-            |args, ctx| async move { handle_edit_schematic_component(args, ctx).await }
+            |args, ctx| async move { super::sch_edit::handle_edit_schematic_component(args, ctx).await }
         ),
         tool!(
             "set_schematic_field_geometry",
@@ -683,101 +688,6 @@ fn ensure_field_flags(prop: &str, indent: &str) -> String {
     out
 }
 
-async fn handle_edit_schematic_component(
-    args: &serde_json::Value,
-    _ctx: &ToolContext,
-) -> anyhow::Result<CallToolResult> {
-    let sch_path = get_path(args, "schematic")?;
-    let reference = match require_str(args, "reference") {
-        Ok(r) => r.to_string(),
-        Err(e) => return Ok(e),
-    };
-
-    let mut content = read_consistent(&sch_path)?;
-    let expected = content.clone();
-    let mut changed = Vec::new();
-
-    // Helper: update a property field value in-place within the symbol block
-    // for `ref_`. Returns the reason on failure so the caller can report it
-    // instead of silently claiming success.
-    let update_field =
-        |content: &str, ref_: &str, field: &str, new_val: &str| -> Result<String, String> {
-            let (sym_start, sym_end) = find_symbol_instance_block(content, ref_)
-                .ok_or_else(|| format!("symbol '{ref_}' not found in this schematic"))?;
-            let sym_block = &content[sym_start..sym_end];
-            let field_search = format!(r#"(property "{field}" ""#);
-            let field_offset = sym_block
-                .find(&field_search)
-                .map(|o| sym_start + o + field_search.len())
-                .ok_or_else(|| format!("'{ref_}' has no '{field}' property"))?;
-            // Find the closing quote of the current value
-            let val_end = content[field_offset..]
-                .find('"')
-                .map(|o| field_offset + o)
-                .ok_or_else(|| format!("'{field}' property on '{ref_}' is malformed"))?;
-            Ok(format!(
-                "{}{}{}",
-                &content[..field_offset],
-                new_val,
-                &content[val_end..]
-            ))
-        };
-
-    let mut errors: Vec<String> = Vec::new();
-    let mut apply = |content: &mut String, field: &str, new_val: &str| match update_field(
-        content, &reference, field, new_val,
-    ) {
-        Ok(updated) => {
-            *content = updated;
-            changed.push(format!("{} → {}", field, new_val));
-        }
-        Err(why) => errors.push(format!("{field}: {why}")),
-    };
-
-    if let Some(new_ref) = opt_str(args, "new_reference") {
-        apply(&mut content, "Reference", new_ref);
-    }
-    if let Some(val) = opt_str(args, "value") {
-        apply(&mut content, "Value", val);
-    }
-    if let Some(fp) = opt_str(args, "footprint") {
-        apply(&mut content, "Footprint", fp);
-    }
-    if let Some(ds) = opt_str(args, "datasheet") {
-        apply(&mut content, "Datasheet", ds);
-    }
-
-    // A request that changed nothing is a failure, not a success — silently
-    // reporting `"changes": []` is what let the tab-indentation bug hide.
-    if changed.is_empty() && !errors.is_empty() {
-        return Ok(CallToolResult::error(format!(
-            "No fields were updated on '{}': {}",
-            reference,
-            errors.join("; ")
-        )));
-    }
-
-    if !changed.is_empty() {
-        let item_id = symbol_item_id(&expected, &reference)?;
-        let command = SchematicCommand::replace_item_from_document(
-            &expected,
-            &content,
-            item_id,
-            format!("Edit {reference}"),
-        )?;
-        commit_command(&sch_path, &command)?;
-    }
-
-    let mut result = json!({
-        "reference": reference,
-        "changes": changed
-    });
-    if !errors.is_empty() {
-        result["errors"] = json!(errors);
-    }
-    Ok(CallToolResult::json(&result))
-}
-
 async fn handle_set_schematic_field_geometry(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -965,7 +875,8 @@ async fn handle_list_schematic_components(
                 "y": y,
                 "rotation": rotation,
                 "mirror_x": mirror.contains('x'),
-                "mirror_y": mirror.contains('y')
+                "mirror_y": mirror.contains('y'),
+                "uuid": sym.uuid
             })
         })
         .collect();
