@@ -50,9 +50,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "sch_batch",
-        description: "Bulk add, edit, delete, and move schematic elements in one call",
+        description: "Bulk add, edit, delete, and move schematic elements in one call; edit note texts",
         category: "schematic",
-        tool_count: 12,
+        tool_count: 13,
     },
     ToolsetMeta {
         name: "sch_export",
@@ -143,7 +143,7 @@ pub fn tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "sch_wiring" => Some(sch_wiring::tools()),
         "sch_bus" => Some(sch_bus::tools()),
         "sch_analysis" => Some(sch_analysis::tools()),
-        "sch_batch" => Some(sch_batch::tools()),
+        "sch_batch" => Some([sch_batch::tools(), sch_text::tools()].concat()),
         "sch_export" => Some(sch_export::tools()),
         "sch_hierarchy" => Some(sch_hierarchy::tools()),
         "pcb_board" => Some(pcb_board::tools()),
