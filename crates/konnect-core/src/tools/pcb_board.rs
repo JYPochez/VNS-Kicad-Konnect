@@ -7,7 +7,7 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
-use konnect_ipc::builders;
+use konnect_ipc::builders::{self, TextStyle};
 use konnect_sexp::{
     parser::parse_sexp,
     writer::{apply_edits, new_uuid, write_atomic, SexpEdit},
@@ -62,13 +62,72 @@ fn format_gr_line(x1: f64, y1: f64, x2: f64, y2: f64, layer: &str, width: f64) -
     )
 }
 
-fn format_gr_text(text: &str, x: f64, y: f64, rot: f64, layer: &str, size: f64) -> String {
+fn format_gr_text(text: &str, x: f64, y: f64, rot: f64, layer: &str, style: &TextStyle) -> String {
+    use konnect_ipc::gen::kiapi::common::types::{
+        HorizontalAlignment as H, VerticalAlignment as V,
+    };
     let uuid = new_uuid();
     let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+    let (w, h, t) = (style.width_mm, style.height_mm, style.thickness_mm);
+    let mut justify = Vec::new();
+    match style.h_align {
+        H::HaLeft => justify.push("left"),
+        H::HaRight => justify.push("right"),
+        _ => {}
+    }
+    match style.v_align {
+        V::VaTop => justify.push("top"),
+        V::VaBottom => justify.push("bottom"),
+        _ => {}
+    }
+    let justify = if justify.is_empty() {
+        String::new()
+    } else {
+        format!(" (justify {})", justify.join(" "))
+    };
     format!(
         "\n  (gr_text \"{escaped}\"\n    (at {x} {y} {rot})\n    (layer \"{layer}\")\n    \
-         (effects (font (size {size} {size}) (thickness 0.15)))\n    (uuid \"{uuid}\")\n  )"
+         (effects (font (size {h} {w}) (thickness {t})){justify})\n    (uuid \"{uuid}\")\n  )"
     )
+}
+
+/// Glyph style from the add_board_text arguments; `Err` names the bad one.
+fn text_style_from_args(args: &serde_json::Value) -> Result<TextStyle, String> {
+    use konnect_ipc::gen::kiapi::common::types::{
+        HorizontalAlignment as H, VerticalAlignment as V,
+    };
+    let size = args["size"].as_f64().unwrap_or(1.0);
+    let mut style = TextStyle::centered(size);
+    if let Some(w) = args["width"].as_f64() {
+        style.width_mm = w;
+    }
+    if let Some(t) = args["thickness"].as_f64() {
+        style.thickness_mm = t;
+    }
+    style.h_align = match args["h_align"].as_str().unwrap_or("center") {
+        "left" => H::HaLeft,
+        "center" => H::HaCenter,
+        "right" => H::HaRight,
+        other => {
+            return Err(format!(
+                "h_align must be left, center or right, got '{other}'"
+            ))
+        }
+    };
+    style.v_align = match args["v_align"].as_str().unwrap_or("center") {
+        "top" => V::VaTop,
+        "center" => V::VaCenter,
+        "bottom" => V::VaBottom,
+        other => {
+            return Err(format!(
+                "v_align must be top, center or bottom, got '{other}'"
+            ))
+        }
+    };
+    if style.height_mm <= 0.0 || style.width_mm <= 0.0 || style.thickness_mm <= 0.0 {
+        return Err("size, width and thickness must be positive".into());
+    }
+    Ok(style)
 }
 
 fn format_npth_footprint(x: f64, y: f64, drill_d: f64, reference: &str) -> String {
@@ -257,7 +316,11 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "add_board_text",
-            "Add a silkscreen or fabrication text string to the board.",
+            "Add a silkscreen or fabrication text string to the board. `size` sets square \
+             glyphs; `width`, `thickness` override the character width and the stroke \
+             (default: width = size, stroke = 15 % of size). `h_align` (left / center / \
+             right) and `v_align` (top / center / bottom) choose which point of the text sits \
+             at x/y — e.g. right-aligned labels ending just before a row of pins.",
             json!({
                 "type": "object",
                 "properties": {
@@ -267,7 +330,11 @@ pub fn tools() -> Vec<ToolDef> {
                     "y":         { "type": "number" },
                     "layer":     { "type": "string", "description": "Layer name", "default": "F.SilkS" },
                     "size":      { "type": "number", "description": "Font size in mm", "default": 1.0 },
-                    "rotation":  { "type": "number", "description": "Rotation in degrees", "default": 0 }
+                    "rotation":  { "type": "number", "description": "Rotation in degrees", "default": 0 },
+                    "width":     { "type": "number", "description": "Character width in mm (default: size)" },
+                    "thickness": { "type": "number", "description": "Stroke width in mm (default: 15 % of size)" },
+                    "h_align":   { "type": "string", "enum": ["left", "center", "right"], "default": "center" },
+                    "v_align":   { "type": "string", "enum": ["top", "center", "bottom"], "default": "center" }
                 },
                 "required": ["board", "text", "x", "y"]
             }),
@@ -724,14 +791,18 @@ async fn handle_add_board_text(
         Err(e) => return Ok(e),
     };
     let layer = args["layer"].as_str().unwrap_or("F.SilkS").to_string();
-    let size = args["size"].as_f64().unwrap_or(1.0);
+    let style = match text_style_from_args(args) {
+        Ok(s) => s,
+        Err(e) => return Ok(CallToolResult::error(e)),
+    };
+    let size = style.height_mm;
     let rotation = args["rotation"].as_f64().unwrap_or(0.0);
 
     // Try IPC first; fall through to file edit if KiCAD isn't reachable.
     let text_ipc = text.clone();
     let layer_ipc = layer.clone();
     if with_ipc(ctx.config.ipc_address.clone(), move |c| {
-        let bt = builders::board_text(&layer_ipc, &text_ipc, x, y, size, rotation, false);
+        let bt = builders::board_text_styled(&layer_ipc, &text_ipc, x, y, &style, rotation, false);
         let any = builders::pack_any(&bt, "kiapi.board.types.BoardText");
         c.create_items(vec![any])
     })
@@ -744,7 +815,7 @@ async fn handle_add_board_text(
         })));
     }
 
-    let gr_text = format_gr_text(&text, x, y, rotation, &layer, size);
+    let gr_text = format_gr_text(&text, x, y, rotation, &layer, &style);
     let content = std::fs::read_to_string(&board_path)?;
     let close_pos = content.rfind(')').unwrap_or(content.len());
     let new_content = apply_edits(content, vec![SexpEdit::insert(close_pos, gr_text)]);
@@ -975,5 +1046,40 @@ mod svg_logo_tests {
 
         let result = handle_import_svg_logo(&args, &ctx).await.unwrap();
         assert!(result.is_error);
+    }
+}
+
+#[cfg(test)]
+mod text_style_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn defaults_keep_the_old_centered_square_text() {
+        let s = text_style_from_args(&json!({ "size": 1.5 })).unwrap();
+        assert_eq!(s, TextStyle::centered(1.5));
+        assert!((s.thickness_mm - 0.225).abs() < 1e-9);
+    }
+
+    #[test]
+    fn width_thickness_and_alignment_are_honoured_in_the_file_fallback() {
+        let s = text_style_from_args(&json!({
+            "size": 1.0, "width": 0.8, "thickness": 0.15, "h_align": "right"
+        }))
+        .unwrap();
+        let out = format_gr_text("GND", 10.0, 20.0, 90.0, "F.SilkS", &s);
+        assert!(
+            out.contains("(size 1 0.8)"),
+            "KiCad writes height then width: {out}"
+        );
+        assert!(out.contains("(thickness 0.15)"), "{out}");
+        assert!(out.contains("(justify right)"), "{out}");
+        assert!(out.contains("(at 10 20 90)"), "{out}");
+    }
+
+    #[test]
+    fn bad_alignment_or_sizes_are_refused() {
+        assert!(text_style_from_args(&json!({ "h_align": "middle" })).is_err());
+        assert!(text_style_from_args(&json!({ "width": 0 })).is_err());
     }
 }

@@ -213,7 +213,7 @@ Seven tools, grouped into *discovery/routing* and *observability*.
 | `set_active_layer` | Set the active layer recorded in the board file's setup section. |
 | `add_board_outline` | Add a rectangular board outline on the Edge.Cuts layer at specified coordinates. |
 | `add_mounting_hole` | Add an NPTH mounting hole footprint at the specified position. |
-| `add_board_text` | Add a silkscreen or fabrication text string to the board. |
+| `add_board_text` | Add a silkscreen or fabrication text. `size` sets square glyphs; optional `width` and `thickness` set the character width and stroke, `h_align` / `v_align` choose which point of the text sits at x/y (e.g. right-aligned pin labels). |
 | `add_zone` | Add a copper fill zone polygon on a specified layer and net. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
 

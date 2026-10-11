@@ -333,6 +333,33 @@ pub fn board_polygon(
     )
 }
 
+/// Glyph size, stroke and anchoring of a board text.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextStyle {
+    /// Character height (mm).
+    pub height_mm: f64,
+    /// Character width (mm).
+    pub width_mm: f64,
+    /// Stroke width (mm).
+    pub thickness_mm: f64,
+    pub h_align: kiapi::common::types::HorizontalAlignment,
+    pub v_align: kiapi::common::types::VerticalAlignment,
+}
+
+impl TextStyle {
+    /// Square glyphs of `size_mm`, stroke 15 % of the size, centred on the
+    /// position — what `board_text` has always produced.
+    pub fn centered(size_mm: f64) -> Self {
+        TextStyle {
+            height_mm: size_mm,
+            width_mm: size_mm,
+            thickness_mm: size_mm * 0.15,
+            h_align: kiapi::common::types::HorizontalAlignment::HaCenter,
+            v_align: kiapi::common::types::VerticalAlignment::VaCenter,
+        }
+    }
+}
+
 /// Build a BoardText. `size_mm` sets both width and height of the glyphs.
 #[allow(clippy::too_many_arguments)]
 pub fn board_text(
@@ -344,21 +371,40 @@ pub fn board_text(
     rotation_deg: f64,
     mirror: bool,
 ) -> kiapi::board::types::BoardText {
+    board_text_styled(
+        layer,
+        text,
+        x,
+        y,
+        &TextStyle::centered(size_mm),
+        rotation_deg,
+        mirror,
+    )
+}
+
+/// Build a BoardText with an explicit glyph size, stroke and anchoring.
+pub fn board_text_styled(
+    layer: &str,
+    text: &str,
+    x: f64,
+    y: f64,
+    style: &TextStyle,
+    rotation_deg: f64,
+    mirror: bool,
+) -> kiapi::board::types::BoardText {
     kiapi::board::types::BoardText {
         id: None,
         text: Some(kiapi::common::types::Text {
             position: Some(vec2(x, y)),
             attributes: Some(kiapi::common::types::TextAttributes {
-                // ponytail: font/alignment/bold/italic left at proto default.
-                // Add args (or a builder struct) when a caller needs them.
                 font_name: String::new(),
-                horizontal_alignment: kiapi::common::types::HorizontalAlignment::HaCenter as i32,
-                vertical_alignment: kiapi::common::types::VerticalAlignment::VaCenter as i32,
+                horizontal_alignment: style.h_align as i32,
+                vertical_alignment: style.v_align as i32,
                 angle: Some(kiapi::common::types::Angle {
                     value_degrees: rotation_deg,
                 }),
                 line_spacing: 1.0,
-                stroke_width: Some(distance(size_mm * 0.15)),
+                stroke_width: Some(distance(style.thickness_mm)),
                 italic: false,
                 bold: false,
                 underlined: false,
@@ -366,7 +412,8 @@ pub fn board_text(
                 mirrored: mirror,
                 multiline: false,
                 keep_upright: false,
-                size: Some(vec2(size_mm, size_mm)),
+                // Vector2 here is (width, height).
+                size: Some(vec2(style.width_mm, style.height_mm)),
             }),
             text: text.to_string(),
             hyperlink: String::new(),
@@ -440,6 +487,26 @@ pub(crate) mod tests {
             }
             _ => panic!("expected Arc geometry"),
         }
+    }
+
+    #[test]
+    fn styled_text_carries_width_height_stroke_and_alignment() {
+        let style = TextStyle {
+            height_mm: 1.0,
+            width_mm: 0.8,
+            thickness_mm: 0.15,
+            h_align: kiapi::common::types::HorizontalAlignment::HaRight,
+            v_align: kiapi::common::types::VerticalAlignment::VaCenter,
+        };
+        let t = board_text_styled("F.SilkS", "GND", 1.0, 2.0, &style, 0.0, false);
+        let attrs = t.text.unwrap().attributes.unwrap();
+        assert_eq!(attrs.size.unwrap().x_nm, 800_000, "x is the width");
+        assert_eq!(attrs.size.unwrap().y_nm, 1_000_000, "y is the height");
+        assert_eq!(attrs.stroke_width.unwrap().value_nm, 150_000);
+        assert_eq!(
+            attrs.horizontal_alignment,
+            kiapi::common::types::HorizontalAlignment::HaRight as i32
+        );
     }
 
     #[test]
