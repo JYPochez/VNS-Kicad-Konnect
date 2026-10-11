@@ -112,6 +112,14 @@ pub(crate) async fn handle_edit_schematic_component(
     }
 
     let edited = apply_edits(content, edits);
+    // Setting a field to the value it already has is a no-op, not an error.
+    if edited == expected {
+        return Ok(CallToolResult::json(&json!({
+            "reference": reference,
+            "changes": [],
+            "unchanged": true
+        })));
+    }
     let ids = blocks
         .iter()
         .map(|(_, _, uuid)| ItemId::new(uuid.clone()))
@@ -260,6 +268,14 @@ mod tests {
         )
         .await;
         assert!(res.is_error);
+        assert_eq!(out, sch);
+    }
+
+    #[tokio::test]
+    async fn setting_the_current_value_is_a_quiet_no_op() {
+        let sch = sheet(&[block("Device:R", "r-1", "R1", 1)]);
+        let (out, res) = edit(&sch, json!({ "reference": "R1", "value": "GND" })).await;
+        assert!(!res.is_error, "{res:?}");
         assert_eq!(out, sch);
     }
 
