@@ -18,8 +18,15 @@ pub struct Symbol {
     pub at: At,
     pub mirror: Option<String>,
     pub unit: u32,
+    /// `(body_style …)`, KiCad's De Morgan alternate. `None` when the file had
+    /// no such node, so a round-trip writes back exactly what was read.
+    pub body_style: Option<u32>,
+    /// `(exclude_from_sim …)`; `None` = absent from the file.
+    pub exclude_from_sim: Option<bool>,
     pub in_bom: bool,
     pub on_board: bool,
+    /// `(in_pos_files …)`; `None` = absent from the file.
+    pub in_pos_files: Option<bool>,
     pub dnp: bool,
     pub fields_autoplaced: bool,
     pub uuid: String,
@@ -36,8 +43,12 @@ impl Symbol {
             at: At::new(x, y),
             mirror: None,
             unit: 1,
+            // The defaults eeschema writes for a newly placed symbol.
+            body_style: Some(1),
+            exclude_from_sim: Some(false),
             in_bom: true,
             on_board: true,
+            in_pos_files: Some(true),
             dnp: false,
             fields_autoplaced: false,
             uuid: uuid::Uuid::new_v4().to_string(),
@@ -65,8 +76,11 @@ impl Symbol {
             .get_value("unit")
             .and_then(|s| s.parse().ok())
             .unwrap_or(1);
+        let body_style = node.get_value("body_style").and_then(|s| s.parse().ok());
+        let exclude_from_sim = node.get_bool("exclude_from_sim");
         let in_bom = node.get_bool("in_bom").unwrap_or(true);
         let on_board = node.get_bool("on_board").unwrap_or(true);
+        let in_pos_files = node.get_bool("in_pos_files");
         let dnp = node.get_bool("dnp").unwrap_or(false);
         let fields_autoplaced = node.find("fields_autoplaced").is_some();
         let uuid = node.get_value("uuid").unwrap_or("").to_owned();
@@ -90,8 +104,11 @@ impl Symbol {
             at,
             mirror,
             unit,
+            body_style,
+            exclude_from_sim,
             in_bom,
             on_board,
+            in_pos_files,
             dnp,
             fields_autoplaced,
             uuid,
@@ -107,9 +124,19 @@ impl Symbol {
         if let Some(m) = &self.mirror {
             c.push(tagged("mirror", vec![atom(m.clone())]));
         }
+        // Attribute order as eeschema writes it (KiCad 10).
         c.push(tagged("unit", vec![atom(self.unit.to_string())]));
+        if let Some(b) = self.body_style {
+            c.push(tagged("body_style", vec![atom(b.to_string())]));
+        }
+        if let Some(v) = self.exclude_from_sim {
+            c.push(tagged("exclude_from_sim", vec![atom(bool_kw(v))]));
+        }
         c.push(tagged("in_bom", vec![atom(bool_kw(self.in_bom))]));
         c.push(tagged("on_board", vec![atom(bool_kw(self.on_board))]));
+        if let Some(v) = self.in_pos_files {
+            c.push(tagged("in_pos_files", vec![atom(bool_kw(v))]));
+        }
         c.push(tagged("dnp", vec![atom(bool_kw(self.dnp))]));
         if self.fields_autoplaced {
             c.push(SexpNode::List(vec![atom("fields_autoplaced")]));

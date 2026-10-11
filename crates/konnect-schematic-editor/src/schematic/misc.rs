@@ -68,6 +68,8 @@ impl Junction {
 #[derive(Debug, Clone)]
 pub struct Text {
     pub text: String,
+    /// `(exclude_from_sim …)`; `None` = absent from the file.
+    pub exclude_from_sim: Option<bool>,
     pub at: At,
     pub uuid: String,
     pub effects: Option<Effects>,
@@ -77,6 +79,7 @@ impl Text {
     pub fn new(text: impl Into<String>, x: f64, y: f64) -> Self {
         Text {
             text: text.into(),
+            exclude_from_sim: Some(false),
             at: At::new(x, y),
             uuid: uuid::Uuid::new_v4().to_string(),
             effects: None,
@@ -94,8 +97,10 @@ impl Text {
             .ok_or(Error::MissingField("at"))?;
         let uuid = node.get_value("uuid").unwrap_or("").to_owned();
         let effects = node.find("effects").and_then(Effects::from_sexp);
+        let exclude_from_sim = node.get_bool("exclude_from_sim");
         Ok(Text {
             text,
+            exclude_from_sim,
             at,
             uuid,
             effects,
@@ -103,7 +108,14 @@ impl Text {
     }
 
     pub fn to_sexp(&self) -> SexpNode {
-        let mut c = vec![atom("text"), qstr(self.text.clone()), self.at.to_sexp()];
+        let mut c = vec![atom("text"), qstr(self.text.clone())];
+        if let Some(v) = self.exclude_from_sim {
+            c.push(tagged(
+                "exclude_from_sim",
+                vec![atom(if v { "yes" } else { "no" })],
+            ));
+        }
+        c.push(self.at.to_sexp());
         if let Some(e) = &self.effects {
             c.push(e.to_sexp());
         }
