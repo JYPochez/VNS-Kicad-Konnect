@@ -148,10 +148,24 @@ impl Schematic {
         self.wires.get_mut(last).expect("just pushed")
     }
 
-    /// Add a junction. Returns a mutable reference to it.
+    /// Add a junction, or return the one already at this point.
+    ///
+    /// Idempotent on purpose: the wiring tools re-derive every T-junction on
+    /// the sheet after each new wire and add them all, so a non-idempotent add
+    /// stacked one more copy of every existing dot per wire (a sheet with 23
+    /// junctions reached 548 after a few edits).
     pub fn add_junction(&mut self, x: f64, y: f64) -> &mut Junction {
-        self.junctions.push(Junction::new(x, y));
-        self.junctions.last_mut().expect("just pushed")
+        match self
+            .junctions
+            .iter()
+            .position(|j| same_point(j.x, j.y, x, y))
+        {
+            Some(i) => &mut self.junctions[i],
+            None => {
+                self.junctions.push(Junction::new(x, y));
+                self.junctions.last_mut().expect("just pushed")
+            }
+        }
     }
 
     /// Add a net label.
@@ -496,7 +510,14 @@ impl Schematic {
 
         // Typed elements in KiCAD 10 required order:
         // junctions → no_connects → wires → texts → labels → sheets → symbols (LAST)
+        // Stacked duplicates written by older versions are merged on the way
+        // out, the way eeschema merges them when it saves.
+        let mut written: Vec<(f64, f64)> = Vec::new();
         for j in &self.junctions {
+            if written.iter().any(|&(x, y)| same_point(x, y, j.x, j.y)) {
+                continue;
+            }
+            written.push((j.x, j.y));
             c.push(j.to_sexp());
         }
         for nc in &self.no_connects {
@@ -574,5 +595,76 @@ fn map_sexp_error(error: konnect_sexp::SexpError) -> crate::error::Error {
         konnect_sexp::SexpError::Io(error) => crate::error::Error::Io(error),
         konnect_sexp::SexpError::Conflict { path } => crate::error::Error::Conflict(path),
         error => crate::error::Error::Io(std::io::Error::other(error)),
+    }
+}
+
+/// Two schematic points closer than a hundredth of a millimetre are one point.
+fn same_point(x1: f64, y1: f64, x2: f64, y2: f64) -> bool {
+    (x1 - x2).abs() < 0.01 && (y1 - y2).abs() < 0.01
+}
+
+#[cfg(test)]
+mod junction_tests {
+    use super::*;
+
+    const TWO_DOTS: &str = "(kicad_sch\n\t(version 20250610)\n\t(generator \"eeschema\")\n\t(uuid \"root\")\n\t(paper \"A4\")\n\t(junction\n\t\t(at 10.16 20.32)\n\t\t(diameter 0)\n\t\t(color 0 0 0 0)\n\t\t(uuid \"j1\")\n\t)\n\t(junction\n\t\t(at 10.16 20.32)\n\t\t(diameter 0)\n\t\t(color 0 0 0 0)\n\t\t(uuid \"j2\")\n\t)\n)\n";
+
+    fn load_str(src: &str) -> (tempfile::NamedTempFile, Schematic) {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        f.write_all(src.as_bytes()).unwrap();
+        f.flush().unwrap();
+        let sch = Schematic::load(f.path()).unwrap();
+        (f, sch)
+    }
+
+    /// Files written by older versions already carry stacked dots; the next
+    /// write merges them.
+    #[test]
+    fn stacked_junctions_in_a_file_are_merged_on_write() {
+        let (f, mut sch) = load_str(TWO_DOTS);
+        assert_eq!(sch.junctions.len(), 2, "loading keeps what the file says");
+        sch.overwrite().unwrap();
+        let out = std::fs::read_to_string(f.path()).unwrap();
+        assert_eq!(out.matches("(junction").count(), 1, "{out}");
+    }
+
+    /// KiCad 10 attributes the typed model used to drop on every write.
+    #[test]
+    fn symbol_and_text_attributes_survive_a_round_trip() {
+        let src = "(kicad_sch\n\t(version 20250610)\n\t(generator \"eeschema\")\n\t(uuid \"root\")\n\t(paper \"A4\")\n\t(text \"note\"\n\t\t(exclude_from_sim no)\n\t\t(at 10 10 0)\n\t\t(effects\n\t\t\t(font\n\t\t\t\t(size 2 2)\n\t\t\t)\n\t\t)\n\t\t(uuid \"t1\")\n\t)\n\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(at 50 60 0)\n\t\t(unit 1)\n\t\t(body_style 1)\n\t\t(exclude_from_sim yes)\n\t\t(in_bom yes)\n\t\t(on_board no)\n\t\t(in_pos_files no)\n\t\t(dnp no)\n\t\t(uuid \"s1\")\n\t\t(property \"Reference\" \"R1\"\n\t\t\t(at 50 56 0)\n\t\t)\n\t)\n)\n";
+        let (f, mut sch) = load_str(src);
+        sch.overwrite().unwrap();
+        let out = std::fs::read_to_string(f.path()).unwrap();
+        for attr in [
+            "(body_style 1)",
+            "(exclude_from_sim yes)",
+            "(on_board no)",
+            "(in_pos_files no)",
+            "(exclude_from_sim no)",
+        ] {
+            assert!(out.contains(attr), "{attr} lost:\n{out}");
+        }
+        let unit = out.find("(unit 1)").unwrap();
+        let body = out.find("(body_style 1)").unwrap();
+        let bom = out.find("(in_bom yes)").unwrap();
+        let pos = out.find("(in_pos_files no)").unwrap();
+        let dnp = out.find("(dnp no)").unwrap();
+        assert!(
+            unit < body && body < bom && bom < pos && pos < dnp,
+            "eeschema order:\n{out}"
+        );
+    }
+
+    #[test]
+    fn adding_a_junction_twice_keeps_one() {
+        let (_f, mut sch) = load_str(TWO_DOTS);
+        sch.junctions.clear();
+        sch.add_junction(10.16, 20.32);
+        sch.add_junction(10.16, 20.32);
+        sch.add_junction(10.160_001, 20.32);
+        assert_eq!(sch.junctions.len(), 1);
+        sch.add_junction(12.7, 20.32);
+        assert_eq!(sch.junctions.len(), 2);
     }
 }
