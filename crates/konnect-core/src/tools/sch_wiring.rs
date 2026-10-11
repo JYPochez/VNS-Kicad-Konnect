@@ -1253,6 +1253,21 @@ async fn handle_batch_rotate_labels(
     Ok(CallToolResult::json(&json!({ "rotated": rotated })))
 }
 
+/// The next free `#PWRnnn` reference: one past the highest number in use.
+///
+/// Counting power symbols is not enough: once one is deleted the count falls
+/// below the highest number, and count + 1 hands out a reference that is still
+/// taken. eeschema then refuses to annotate ("Duplicate items #PWR025").
+fn next_power_reference(sch: &cse::Schematic) -> String {
+    let highest = sch
+        .symbols
+        .iter()
+        .filter_map(|s| s.reference()?.strip_prefix("#PWR")?.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0);
+    format!("#PWR{:03}", highest + 1)
+}
+
 async fn handle_add_power_symbol(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -1274,17 +1289,7 @@ async fn handle_add_power_symbol(
 
     let mut sch = cse::Schematic::load(&sch_path)?;
 
-    // Auto-number the #PWR reference by counting existing power symbols
-    let pwr_count = sch
-        .symbols
-        .iter()
-        .filter(|s| {
-            s.reference()
-                .map(|r| r.starts_with("#PWR"))
-                .unwrap_or(false)
-        })
-        .count();
-    let pwr_ref = format!("#PWR{:03}", pwr_count + 1);
+    let pwr_ref = next_power_reference(&sch);
 
     // Embed the power symbol definition in lib_symbols
     let lib_id = format!("power:{}", power_net);
@@ -2402,6 +2407,76 @@ mod power_symbol_tests {
             !after.contains("(property \"Reference\" \"#PWR001\")\n"),
             "must not write a bare Reference with no (at)"
         );
+    }
+
+    /// Every wire added used to re-add every T-junction already on the sheet.
+    #[tokio::test]
+    async fn batch_add_wire_does_not_restack_existing_junctions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tee.kicad_sch");
+        // A T at (20, 10): a horizontal wire with a vertical one landing on it.
+        std::fs::write(
+            &path,
+            "(kicad_sch\n\t(version 20250610)\n\t(generator \"eeschema\")\n\t(uuid \"root\")\n\t(paper \"A4\")\n\t(junction\n\t\t(at 20.32 10.16)\n\t\t(diameter 0)\n\t\t(color 0 0 0 0)\n\t\t(uuid \"j1\")\n\t)\n\t(wire\n\t\t(pts\n\t\t\t(xy 10.16 10.16) (xy 30.48 10.16)\n\t\t)\n\t\t(stroke\n\t\t\t(width 0)\n\t\t\t(type default)\n\t\t)\n\t\t(uuid \"w1\")\n\t)\n\t(wire\n\t\t(pts\n\t\t\t(xy 20.32 10.16) (xy 20.32 20.32)\n\t\t)\n\t\t(stroke\n\t\t\t(width 0)\n\t\t\t(type default)\n\t\t)\n\t\t(uuid \"w2\")\n\t)\n)\n",
+        )
+        .unwrap();
+        let r = handle_batch_add_wire(
+            &json!({
+                "schematic": path.display().to_string(),
+                "wires": [
+                    { "x1": 50.8, "y1": 50.8, "x2": 60.96, "y2": 50.8 },
+                    { "x1": 50.8, "y1": 60.96, "x2": 60.96, "y2": 60.96 },
+                    { "x1": 50.8, "y1": 71.12, "x2": 60.96, "y2": 71.12 }
+                ]
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!r.is_error, "{r:?}");
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(out.matches("(junction").count(), 1, "{out}");
+    }
+
+    #[tokio::test]
+    async fn add_power_symbol_numbers_past_the_highest_reference_not_the_count() {
+        // A sheet that once had #PWR001..#PWR003 and lost #PWR002: two power
+        // symbols remain, so count + 1 would hand out #PWR003 a second time.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("power.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch\n  (version 20250610)\n  (generator \"konnect\")\n  (uuid \"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\")\n  (paper \"A4\")\n  (lib_symbols\n    (symbol \"power:GND\"\n      (property \"Reference\" \"#PWR\" (at 0 0 0))\n      (property \"Value\" \"GND\" (at 0 0 0))\n    )\n  )\n)\n",
+        )
+        .unwrap();
+        let place = |x: f64| {
+            json!({
+                "schematic": path.display().to_string(),
+                "power_net": "GND",
+                "x": x,
+                "y": 80.0
+            })
+        };
+        for x in [10.0, 20.0, 30.0] {
+            let r = handle_add_power_symbol(&place(x), &test_ctx())
+                .await
+                .unwrap();
+            assert!(!r.is_error, "{r:?}");
+        }
+
+        let mut sch = cse::Schematic::load(&path).unwrap();
+        sch.symbols.retain(|s| s.reference() != Some("#PWR002"));
+        sch.overwrite().unwrap();
+
+        let r = handle_add_power_symbol(&place(40.0), &test_ctx())
+            .await
+            .unwrap();
+        assert!(!r.is_error, "{r:?}");
+
+        let sch = cse::Schematic::load(&path).unwrap();
+        let mut refs: Vec<_> = sch.symbols.iter().filter_map(|s| s.reference()).collect();
+        refs.sort_unstable();
+        assert_eq!(refs, ["#PWR001", "#PWR003", "#PWR004"]);
     }
 }
 
