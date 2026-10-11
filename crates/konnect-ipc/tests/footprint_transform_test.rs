@@ -300,3 +300,87 @@ fn rotate_footprint_rotates_children_around_anchor() {
     .unwrap();
     assert_eq!(pad.pad_stack.unwrap().angle.unwrap().value_degrees, 90.0);
 }
+
+fn field_mm(f: &Option<kiapi::board::types::Field>) -> (f64, f64, f64) {
+    let t = f
+        .as_ref()
+        .unwrap()
+        .text
+        .as_ref()
+        .unwrap()
+        .text
+        .as_ref()
+        .unwrap();
+    let p = t.position.unwrap();
+    let a = t
+        .attributes
+        .as_ref()
+        .and_then(|a| a.angle.as_ref())
+        .map(|a| a.value_degrees)
+        .unwrap_or(0.0);
+    (builders::nm_to_mm(p.x_nm), builders::nm_to_mm(p.y_nm), a)
+}
+
+/// The label moves; the footprint, its pads and its other text do not.
+#[test]
+fn field_position_offset_moves_only_the_reference_text() {
+    use konnect_ipc::client::{FieldPosition, FootprintField};
+    let (mock, captured) = spawn_footprint_mock(mk_footprint_r1());
+    let client = KiCadIpcClient::new(&mock.url);
+
+    let at = client
+        .set_footprint_field_position(
+            "R1",
+            FootprintField::Reference,
+            FieldPosition::Offset { dx: 0.0, dy: 3.5 },
+            None,
+        )
+        .unwrap();
+    assert_eq!(at, (100.0, 103.5));
+
+    let update = captured.lock().unwrap().take().expect("UpdateItems sent");
+    let sent =
+        kiapi::board::types::FootprintInstance::decode(update.items[0].value.as_slice()).unwrap();
+    assert_eq!(field_mm(&sent.reference_field), (100.0, 103.5, 0.0));
+    let pos = sent.position.unwrap();
+    assert_eq!(
+        (builders::nm_to_mm(pos.x_nm), builders::nm_to_mm(pos.y_nm)),
+        (100.0, 100.0)
+    );
+    assert_eq!(pad_positions_mm(&sent), vec![(99.0, 100.0), (101.0, 100.0)]);
+}
+
+#[test]
+fn field_position_absolute_with_angle() {
+    use konnect_ipc::client::{FieldPosition, FootprintField};
+    let (mock, captured) = spawn_footprint_mock(mk_footprint_r1());
+    let client = KiCadIpcClient::new(&mock.url);
+
+    client
+        .set_footprint_field_position(
+            "R1",
+            FootprintField::Reference,
+            FieldPosition::Absolute { x: 95.0, y: 100.0 },
+            Some(90.0),
+        )
+        .unwrap();
+    let update = captured.lock().unwrap().take().expect("UpdateItems sent");
+    let sent =
+        kiapi::board::types::FootprintInstance::decode(update.items[0].value.as_slice()).unwrap();
+    assert_eq!(field_mm(&sent.reference_field), (95.0, 100.0, 90.0));
+}
+
+#[test]
+fn field_position_on_an_unknown_footprint_fails() {
+    use konnect_ipc::client::{FieldPosition, FootprintField};
+    let (mock, _captured) = spawn_footprint_mock(mk_footprint_r1());
+    let client = KiCadIpcClient::new(&mock.url);
+    assert!(client
+        .set_footprint_field_position(
+            "R99",
+            FootprintField::Value,
+            FieldPosition::Offset { dx: 0.0, dy: 1.0 },
+            None,
+        )
+        .is_err());
+}

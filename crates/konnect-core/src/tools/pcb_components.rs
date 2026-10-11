@@ -20,7 +20,7 @@ use std::path::Path;
 
 // ─── IPC helper ───────────────────────────────────────────────────────────────
 
-async fn with_ipc<T, F>(addr: String, f: F) -> anyhow::Result<Result<T, String>>
+pub(crate) async fn with_ipc<T, F>(addr: String, f: F) -> anyhow::Result<Result<T, String>>
 where
     T: Send + 'static,
     F: FnOnce(&KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,

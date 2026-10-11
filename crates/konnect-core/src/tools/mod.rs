@@ -10,6 +10,7 @@ pub mod manufacturing;
 pub mod pcb_board;
 pub mod pcb_components;
 pub mod pcb_export;
+pub mod pcb_fields;
 pub mod pcb_routing;
 pub mod project;
 pub mod sch_analysis;

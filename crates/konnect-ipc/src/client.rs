@@ -152,6 +152,21 @@ pub struct KiCadIpcClient {
     client_name: String,
 }
 
+/// Which of a footprint's mandatory texts to address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FootprintField {
+    Reference,
+    Value,
+}
+
+/// Where to put a footprint text: absolute board coordinates, or an offset
+/// from the footprint's anchor (both mm, board axes).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FieldPosition {
+    Absolute { x: f64, y: f64 },
+    Offset { dx: f64, dy: f64 },
+}
+
 impl KiCadIpcClient {
     /// Create a client connecting to the given IPC socket path.
     /// If empty, tries KICAD_API_SOCKET environment variable.
@@ -1088,6 +1103,66 @@ impl KiCadIpcClient {
             }
         }
         anyhow::bail!("Footprint '{reference}' not found")
+    }
+
+    /// Move a footprint's Reference or Value text, as pcbnew's `M` on the text
+    /// does — the footprint itself stays put.
+    ///
+    /// `pos` is either absolute board coordinates or an offset from the
+    /// footprint's anchor, both in mm along the board axes. `angle` (degrees,
+    /// absolute on the board) is left unchanged when `None`. Returns the text's
+    /// new absolute position in mm.
+    ///
+    /// KiCAD carries a footprint's fields in absolute board coordinates over
+    /// IPC, so setting the text position is the whole move.
+    pub fn set_footprint_field_position(
+        &self,
+        reference: &str,
+        field: FootprintField,
+        pos: FieldPosition,
+        angle: Option<f64>,
+    ) -> Result<(f64, f64)> {
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        for item in &items {
+            let Ok(mut fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            else {
+                continue;
+            };
+            let ref_text = fp
+                .reference_field
+                .as_ref()
+                .and_then(|f| f.text.as_ref())
+                .and_then(|bt| bt.text.as_ref())
+                .map(|t| t.text.as_str())
+                .unwrap_or("");
+            if ref_text != reference {
+                continue;
+            }
+            let anchor = fp.position.unwrap_or_default();
+            let target = match field {
+                FootprintField::Reference => fp.reference_field.as_mut(),
+                FootprintField::Value => fp.value_field.as_mut(),
+            };
+            let text = target
+                .and_then(|f| f.text.as_mut())
+                .and_then(|bt| bt.text.as_mut())
+                .ok_or_else(|| anyhow::anyhow!("Footprint '{reference}' has no {field:?} text"))?;
+            let (x, y) = match pos {
+                FieldPosition::Absolute { x, y } => (x, y),
+                FieldPosition::Offset { dx, dy } => {
+                    (anchor.x_nm as f64 / 1e6 + dx, anchor.y_nm as f64 / 1e6 + dy)
+                }
+            };
+            text.position = Some(crate::builders::vec2(x, y));
+            if let Some(a) = angle {
+                text.attributes.get_or_insert_with(Default::default).angle =
+                    Some(kiapi::common::types::Angle { value_degrees: a });
+            }
+            let any = crate::builders::pack_any(&fp, "kiapi.board.types.FootprintInstance");
+            self.update_items(vec![any])?;
+            return Ok((x, y));
+        }
+        anyhow::bail!("Footprint '{}' not found", reference)
     }
 
     /// Delete a footprint by reference.

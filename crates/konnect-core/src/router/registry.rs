@@ -74,9 +74,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "pcb_components",
-        description: "Place, move, rotate, flip, align, and duplicate PCB footprints",
+        description: "Place, move, rotate, flip, align, and duplicate PCB footprints; move their Reference/Value text",
         category: "pcb",
-        tool_count: 14,
+        tool_count: 15,
     },
     ToolsetMeta {
         name: "pcb_routing",
@@ -147,7 +147,7 @@ pub fn tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "sch_export" => Some(sch_export::tools()),
         "sch_hierarchy" => Some(sch_hierarchy::tools()),
         "pcb_board" => Some(pcb_board::tools()),
-        "pcb_components" => Some(pcb_components::tools()),
+        "pcb_components" => Some([pcb_components::tools(), pcb_fields::tools()].concat()),
         "pcb_routing" => Some(pcb_routing::tools()),
         "pcb_export" => Some(pcb_export::tools()),
         "library" => Some([library::tools(), library_graphics::tools()].concat()),
