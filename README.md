@@ -66,6 +66,23 @@ that teach Claude KiCAD conventions out of the box.
 >   format wants `\n`. Either one makes the whole schematic fail to load, while the tool
 >   reports success.
 >
+> - **Writing a schematic no longer restacks junctions.** The wiring tools re-derived every
+>   T-junction on the sheet after each new wire and added them all again; a sheet with 23
+>   dots reached 548 after a dozen edits. `add_junction` is now idempotent, and stacked dots
+>   already in a file are merged on the next write, as eeschema does.
+> - **KiCad 10 symbol attributes survive a write.** `body_style`, `exclude_from_sim` and
+>   `in_pos_files` (and `exclude_from_sim` on texts) were dropped by every typed round-trip,
+>   turning a one-wire edit into hundreds of lines of diff. A real 60-symbol schematic now
+>   round-trips line for line.
+> - **No more duplicate `#PWR` references.** New power symbols were numbered from the count,
+>   so after a deletion the next one reused a reference still in use and eeschema refused to
+>   annotate. They now take the highest number plus one.
+> - **Renames reach the reference eeschema reads.** `edit_schematic_component` changed only
+>   the Reference field, not the `(instances …)` entry, and only the first unit. It now
+>   renames every unit and its instance entries, refuses a reference already taken, and takes
+>   an optional `uuid` to rename one of two symbols that share a reference. Setting a field
+>   to its current value is a no-op instead of an error.
+>
 > **Added tools**
 >
 > - **`sch_bus` toolset** — `add_bus`, `batch_add_bus`, `add_bus_entry`, and
@@ -104,7 +121,15 @@ that teach Claude KiCAD conventions out of the box.
 > - `copy_footprint` — copies a footprint into a library under a new name, so a stock
 >   footprint can be varied without editing the stock library.
 >
-> 548 tests; `cargo clippy --workspace -- -D warnings` clean.
+> - `move_footprint_text` — moves a placed footprint's Reference or Value text, by absolute
+>   position or offset from the footprint, as **M** on the text does in pcbnew. Clears labels
+>   clipped by the board edge or sitting on a pad.
+> - `add_board_text` gains `width`, `thickness`, `h_align` and `v_align`, so pin labels can be
+>   set at a fab's minimum size and aligned against a row of pads instead of centred by guess.
+> - `edit_schematic_text` — replaces a phrase inside an existing schematic note;
+>   `add_schematic_text` could only create one.
+>
+> 569 tests; `cargo clippy --workspace -- -D warnings` clean.
 
 > **Status: beta.** The core toolchain is tested and working, but this is a young
 > release and it wants real-world mileage and review. Issues and PRs are welcome —
